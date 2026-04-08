@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use near_api::types::transaction::{SignedTransaction, Transaction};
 use near_api::types::Signature;
 use near_api::{AccountId, Contract, Signer};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
@@ -12,18 +12,85 @@ pub fn mpc_account() -> Result<AccountId> {
     MPC_CONTRACT.parse().context("MPC contract ID")
 }
 
+// ── Type-safe MPC request/response types ─────────────────────────────────────
+
+/// Domain identifier for key derivation
+#[derive(Clone, Copy, Debug, Serialize)]
+#[repr(u8)]
+pub enum DomainId {
+    /// Ed25519 (NEAR) key derivation
+    Ed25519 = 1,
+    /// Secp256k1 (EVM/BTC) key derivation
+    Secp256k1 = 2,
+}
+
+/// The payload to sign
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", content = "data")]
+pub enum SignPayload {
+    /// EdDSA (Ed25519) — hex-encoded 32-byte hash
+    #[serde(rename = "Eddsa")]
+    Eddsa(String),
+    /// ECDSA (secp256k1) — EIP-191 or ERC-712
+    #[serde(rename = "Ecsa")]
+    Ecsa { message: String, signer_scheme: SignerScheme },
+}
+
+/// ECDSA signing scheme variants
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", content = "data")]
+pub enum SignerScheme {
+    #[serde(rename = "Eip191")]
+    Eip191,
+    #[serde(rename = "Erc712")]
+    Erc712 { types: serde_json::Value, primary_type: String },
+}
+
+/// Top-level sign request
+#[derive(Debug, Serialize)]
+struct SignRequest {
+    request: SignRequestInner,
+}
+
+#[derive(Debug, Serialize)]
+struct SignRequestInner {
+    payload_v2: SignPayload,
+    path: String,
+    domain_id: DomainId,
+}
+
+/// Derive key request
+#[derive(Debug, Serialize)]
+struct DeriveKeyRequest {
+    path: String,
+    predecessor: String,
+    domain_id: DomainId,
+}
+
+/// MPC signature response
+#[derive(Debug, Deserialize)]
+pub struct SignResult {
+    #[allow(dead_code)]
+    pub scheme: String,
+    pub signature: Vec<u8>,
+}
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
 /// Derive the ed25519 public key from MPC for a given path.
 pub async fn derive_public_key(
     path: &str,
     predecessor: &str,
     network: &near_api::NetworkConfig,
 ) -> Result<String> {
+    let req = DeriveKeyRequest {
+        path: path.to_string(),
+        predecessor: predecessor.to_string(),
+        domain_id: DomainId::Ed25519,
+    };
+
     let derived: near_api::Data<serde_json::Value> = Contract(mpc_account()?)
-        .call_function("derived_public_key", serde_json::json!({
-            "path": path,
-            "predecessor": predecessor,
-            "domain_id": 1,
-        }))
+        .call_function("derived_public_key", &req)
         .read_only()
         .fetch_from(network)
         .await
@@ -44,14 +111,6 @@ pub async fn derive_key_for_config(cfg: &Config) -> Result<String> {
     derive_public_key(&cfg.mpc_path, cfg.near_account.as_str(), &cfg.network).await
 }
 
-/// MPC signature response
-#[derive(Debug, Deserialize)]
-pub struct SignResult {
-    #[allow(dead_code)]
-    pub scheme: String,
-    pub signature: Vec<u8>,
-}
-
 /// Request MPC to sign a 32-byte payload.
 pub async fn sign_payload(
     payload: &[u8; 32],
@@ -61,17 +120,19 @@ pub async fn sign_payload(
     sponsor_key: &str,
     network: &near_api::NetworkConfig,
 ) -> Result<SignResult> {
+    let req = SignRequest {
+        request: SignRequestInner {
+            payload_v2: SignPayload::Eddsa(hex::encode(payload)),
+            path: path.to_string(),
+            domain_id: DomainId::Ed25519,
+        },
+    };
+
     let signer = Signer::from_secret_key(sponsor_key.parse()?)?;
     tracing::info!("MPC.sign(path={}, sponsor={})", path, sponsor_id);
 
     let result = Contract(mpc_account()?)
-        .call_function("sign", serde_json::json!({
-            "request": {
-                "payload_v2": { "Eddsa": hex::encode(payload) },
-                "path": path,
-                "domain_id": 1,
-            }
-        }))
+        .call_function("sign", &req)
         .transaction()
         .gas(near_api::NearGas::from_tgas(100))
         .deposit(near_api::NearToken::from_yoctonear(1))
@@ -108,7 +169,6 @@ pub async fn sign_payload_with_config(cfg: &Config, payload: &[u8; 32]) -> Resul
 
 // ── Shared internals ─────────────────────────────────────────────────────────
 
-/// Sign a transaction via MPC. Returns (signed_tx, tx_hash_hex).
 async fn sign_tx(
     unsigned_tx: &Transaction,
     payload: &[u8; 32],
@@ -204,7 +264,6 @@ pub async fn sign_and_broadcast_async(
     let rpc = rpc_url(network);
     let client = reqwest::Client::new();
 
-    // Submit async (returns immediately)
     tracing::info!("Submitting tx async to {}", rpc);
     let resp = rpc_post(&client, &rpc, &serde_json::json!({
         "jsonrpc": "2.0", "id": "0",
@@ -213,7 +272,6 @@ pub async fn sign_and_broadcast_async(
     })).await?;
     if let Some(error) = resp.get("error") { anyhow::bail!("RPC error: {:?}", error); }
 
-    // Poll for finality (up to 60s)
     tracing::info!("Polling for finality: {}", tx_hash_hex);
     for attempt in 0..30 {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;

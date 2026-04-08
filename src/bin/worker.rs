@@ -453,6 +453,7 @@ impl Worker {
         Ok(())
     }
 
+    #[allow(clippy::clone_on_copy)]
     async fn execute_transfer(
         &self,
         params: &JobParams,
@@ -633,7 +634,7 @@ async fn main() -> Result<()> {
             let fd = log.into_raw_fd();
             unsafe {
                 libc::close(0); libc::close(1); libc::close(2);
-                libc::open(c"/dev/null".as_ptr() as *const i8, libc::O_RDONLY);
+                libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
                 libc::dup(fd); libc::dup(fd); libc::close(fd);
             }
         }
