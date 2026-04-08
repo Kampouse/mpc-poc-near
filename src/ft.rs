@@ -78,12 +78,15 @@ pub async fn show_common_balances(cfg: &Config) -> Result<()> {
     for contract_id in COMMON_TOKENS {
         let contract: AccountId = contract_id.parse()
             .with_context(|| format!("Invalid FT contract ID: {}", contract_id))?;
+        // Fetch metadata first, then balance — avoids double call
+        let meta = match get_metadata(&cfg.network, &contract).await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
         if let Ok(balance) = get_balance(&cfg.network, &cfg.near_account, &contract).await {
             if balance > 0 {
-                if let Ok(meta) = get_metadata(&cfg.network, &contract).await {
-                    let human = balance as f64 / 10u128.pow(meta.decimals as u32) as f64;
-                    println!("║   {}: {:.6}", format!("{:8}", meta.symbol), human);
-                }
+                let human = balance as f64 / 10u128.pow(meta.decimals as u32) as f64;
+                println!("║   {}: {:.6}", format!("{:8}", meta.symbol), human);
             }
         }
     }

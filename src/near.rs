@@ -1,11 +1,8 @@
 use anyhow::{Context, Result};
-#[allow(unused_imports)]
-use borsh::BorshSerialize;
-use ed25519_dalek::Signer as DalekSigner;
 use near_api::types::transaction::actions::{FunctionCallAction, TransferAction};
 use near_api::types::transaction::{Transaction, TransactionV0};
 use near_api::types::{Action, CryptoHash, PublicKey};
-use near_api::{Account, AccountId, NearGas, NearToken, Signer};
+use near_api::{Account, AccountId, NearGas, NearToken};
 use sha2::{Digest, Sha256};
 use std::str::FromStr;
 
@@ -18,7 +15,7 @@ use crate::mpc;
 pub async fn create_account(cfg: &Config) -> Result<()> {
     let (funder_id, funder_key) = cfg.require_funder()?;
     let near_public_key = derive_key(cfg).await?;
-    let signer = Signer::from_secret_key(funder_key.parse()?)?;
+    let signer = near_api::Signer::from_secret_key(funder_key.parse()?)?;
 
     println!("Creating {} with MPC-derived key\n", cfg.near_account);
 
@@ -203,7 +200,7 @@ async fn sign_and_send(cfg: &Config, unsigned_tx: &Transaction) -> Result<()> {
 
     // Nostr authorization proof
     let auth_msg = format!("authorize from {} | hash:{}", cfg.near_account, hex::encode(tx_hash));
-    let auth_sig = cfg.nostr_sk.sign(auth_msg.as_bytes());
+    let auth_sig = ed25519_dalek::Signer::sign(&cfg.nostr_sk, auth_msg.as_bytes());
     println!("③ Nostr auth: {}...✅", &hex::encode(auth_sig.to_bytes())[..16]);
 
     // Call MPC to sign + broadcast

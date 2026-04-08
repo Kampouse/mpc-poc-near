@@ -44,7 +44,7 @@ pub async fn derive_key_for_config(cfg: &Config) -> Result<String> {
     derive_public_key(&cfg.mpc_path, cfg.near_account.as_str(), &cfg.network).await
 }
 
-/// MPC signature response: {"scheme": "Ed25519", "signature": [u8; 64]}
+/// MPC signature response
 #[derive(Debug, Deserialize)]
 pub struct SignResult {
     #[allow(dead_code)]
@@ -52,7 +52,7 @@ pub struct SignResult {
     pub signature: Vec<u8>,
 }
 
-/// Request MPC to sign a 32-byte payload and return the signature.
+/// Request MPC to sign a 32-byte payload.
 pub async fn sign_payload(
     payload: &[u8; 32],
     path: &str,
@@ -106,65 +106,10 @@ pub async fn sign_payload_with_config(cfg: &Config, payload: &[u8; 32]) -> Resul
     sign_payload(payload, &cfg.mpc_path, cfg.near_account.as_str(), sponsor_id, sponsor_key, &cfg.network).await
 }
 
-/// Assemble signed tx and broadcast via RPC.
-pub async fn assemble_and_broadcast(
-    unsigned_tx: &Transaction,
-    signature_bytes: &[u8],
-    network: &near_api::NetworkConfig,
-) -> Result<String> {
-    let sig = Signature::from_parts(
-        near_api::types::crypto::KeyType::ED25519,
-        signature_bytes,
-    ).context("Invalid ed25519 signature bytes")?;
+// ── Shared internals ─────────────────────────────────────────────────────────
 
-    let signed_tx = SignedTransaction::new(sig, unsigned_tx.clone());
-    let tx_hash = signed_tx.get_hash();
-    let tx_hash_hex = tx_hash.to_string();
-    tracing::info!("Signed TX hash: {}", tx_hash_hex);
-
-    let tx_borsh = borsh::to_vec(&signed_tx)?;
-    let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_borsh);
-
-    let rpc_url = network.rpc_endpoints.first()
-        .map(|e| e.url.to_string())
-        .unwrap_or_else(|| "https://rpc.testnet.near.org".to_string());
-
-    let rpc_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": "0",
-        "method": "broadcast_tx_commit",
-        "params": [tx_b64]
-    });
-
-    tracing::info!("Broadcasting to {}", rpc_url);
-    let client = reqwest::Client::new();
-    let resp: serde_json::Value = client
-        .post(&rpc_url)
-        .json(&rpc_body)
-        .send()
-        .await
-        .context("RPC request failed")?
-        .json()
-        .await
-        .context("RPC response parse failed")?;
-
-    if let Some(error) = resp.get("error") {
-        anyhow::bail!("RPC error: {:?}", error);
-    }
-
-    let result = resp.get("result").context("No result in RPC response")?;
-    let final_hash = result.get("transaction_outcome")
-        .and_then(|r| r.get("id"))
-        .and_then(|id| id.as_str())
-        .unwrap_or(&tx_hash_hex)
-        .to_string();
-
-    tracing::info!("TX finalized: {} — https://explorer.testnet.near.org/transactions/{}", final_hash, final_hash);
-    Ok(final_hash)
-}
-
-/// Full pipeline: MPC sign → assemble → broadcast (waits for finality)
-pub async fn sign_and_broadcast(
+/// Sign a transaction via MPC. Returns (signed_tx, tx_hash_hex).
+async fn sign_tx(
     unsigned_tx: &Transaction,
     payload: &[u8; 32],
     path: &str,
@@ -172,24 +117,7 @@ pub async fn sign_and_broadcast(
     sponsor_id: &AccountId,
     sponsor_key: &str,
     network: &near_api::NetworkConfig,
-) -> Result<String> {
-    let sign_result = sign_payload(payload, path, predecessor, sponsor_id, sponsor_key, network).await?;
-    if sign_result.signature.len() != 64 {
-        anyhow::bail!("Expected 64-byte ed25519 signature, got {} bytes", sign_result.signature.len());
-    }
-    assemble_and_broadcast(unsigned_tx, &sign_result.signature, network).await
-}
-
-/// #14: Async broadcast — submits tx and returns immediately, then polls for finality
-pub async fn sign_and_broadcast_async(
-    unsigned_tx: &Transaction,
-    payload: &[u8; 32],
-    path: &str,
-    predecessor: &str,
-    sponsor_id: &AccountId,
-    sponsor_key: &str,
-    network: &near_api::NetworkConfig,
-) -> Result<String> {
+) -> Result<(SignedTransaction, String)> {
     let sign_result = sign_payload(payload, path, predecessor, sponsor_id, sponsor_key, network).await?;
     if sign_result.signature.len() != 64 {
         anyhow::bail!("Expected 64-byte ed25519 signature, got {} bytes", sign_result.signature.len());
@@ -201,69 +129,107 @@ pub async fn sign_and_broadcast_async(
     ).context("Invalid ed25519 signature bytes")?;
 
     let signed_tx = SignedTransaction::new(sig, unsigned_tx.clone());
-    let tx_hash = signed_tx.get_hash();
-    let tx_hash_hex = tx_hash.to_string();
+    let tx_hash_hex = signed_tx.get_hash().to_string();
     tracing::info!("Signed TX hash: {}", tx_hash_hex);
+    Ok((signed_tx, tx_hash_hex))
+}
 
-    let tx_borsh = borsh::to_vec(&signed_tx)?;
-    let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_borsh);
+fn encode_tx(signed_tx: &SignedTransaction) -> Result<String> {
+    let tx_borsh = borsh::to_vec(signed_tx)?;
+    Ok(base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_borsh))
+}
 
-    let rpc_url = network.rpc_endpoints.first()
+fn rpc_url(network: &near_api::NetworkConfig) -> String {
+    network.rpc_endpoints.first()
         .map(|e| e.url.to_string())
-        .unwrap_or_else(|| "https://rpc.testnet.near.org".to_string());
+        .unwrap_or_else(|| "https://rpc.testnet.near.org".to_string())
+}
 
-    // Submit async (broadcast_tx_async — returns immediately)
+async fn rpc_post(client: &reqwest::Client, url: &str, body: &serde_json::Value) -> Result<serde_json::Value> {
+    client.post(url).json(body).send().await
+        .context("RPC request failed")?
+        .json().await
+        .context("RPC response parse failed")
+}
+
+// ── Broadcast pipelines ──────────────────────────────────────────────────────
+
+/// MPC sign → broadcast (waits for finality). Used by CLI.
+pub async fn sign_and_broadcast(
+    unsigned_tx: &Transaction,
+    payload: &[u8; 32],
+    path: &str,
+    predecessor: &str,
+    sponsor_id: &AccountId,
+    sponsor_key: &str,
+    network: &near_api::NetworkConfig,
+) -> Result<String> {
+    let (signed_tx, tx_hash_hex) = sign_tx(unsigned_tx, payload, path, predecessor, sponsor_id, sponsor_key, network).await?;
+    let tx_b64 = encode_tx(&signed_tx)?;
+
+    let rpc = rpc_url(network);
     let client = reqwest::Client::new();
-    let async_body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": "0",
+    let resp = rpc_post(&client, &rpc, &serde_json::json!({
+        "jsonrpc": "2.0", "id": "0",
+        "method": "broadcast_tx_commit",
+        "params": [tx_b64]
+    })).await?;
+
+    if let Some(error) = resp.get("error") { anyhow::bail!("RPC error: {:?}", error); }
+
+    let final_hash = resp.get("result")
+        .and_then(|r| r.get("transaction_outcome"))
+        .and_then(|r| r.get("id"))
+        .and_then(|id| id.as_str())
+        .unwrap_or(&tx_hash_hex)
+        .to_string();
+
+    tracing::info!("TX finalized: {} — https://explorer.testnet.near.org/transactions/{}", final_hash, final_hash);
+    Ok(final_hash)
+}
+
+/// MPC sign → async submit → poll for finality. Used by worker.
+pub async fn sign_and_broadcast_async(
+    unsigned_tx: &Transaction,
+    payload: &[u8; 32],
+    path: &str,
+    predecessor: &str,
+    sponsor_id: &AccountId,
+    sponsor_key: &str,
+    network: &near_api::NetworkConfig,
+) -> Result<String> {
+    let (signed_tx, tx_hash_hex) = sign_tx(unsigned_tx, payload, path, predecessor, sponsor_id, sponsor_key, network).await?;
+    let tx_b64 = encode_tx(&signed_tx)?;
+
+    let rpc = rpc_url(network);
+    let client = reqwest::Client::new();
+
+    // Submit async (returns immediately)
+    tracing::info!("Submitting tx async to {}", rpc);
+    let resp = rpc_post(&client, &rpc, &serde_json::json!({
+        "jsonrpc": "2.0", "id": "0",
         "method": "broadcast_tx_async",
         "params": [tx_b64]
-    });
-
-    tracing::info!("Submitting tx async to {}", rpc_url);
-    let resp: serde_json::Value = client
-        .post(&rpc_url)
-        .json(&async_body)
-        .send()
-        .await
-        .context("RPC submit failed")?
-        .json()
-        .await
-        .context("RPC response parse failed")?;
-
-    if let Some(error) = resp.get("error") {
-        anyhow::bail!("RPC error: {:?}", error);
-    }
+    })).await?;
+    if let Some(error) = resp.get("error") { anyhow::bail!("RPC error: {:?}", error); }
 
     // Poll for finality (up to 60s)
     tracing::info!("Polling for finality: {}", tx_hash_hex);
     for attempt in 0..30 {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-        let check_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": "0",
+        let check_resp = rpc_post(&client, &rpc, &serde_json::json!({
+            "jsonrpc": "2.0", "id": "0",
             "method": "tx",
             "params": [tx_hash_hex, "unused"]
-        });
-
-        let check_resp: serde_json::Value = match client
-            .post(&rpc_url)
-            .json(&check_body)
-            .send()
-            .await
-        {
-            Ok(r) => r.json().await.unwrap_or(serde_json::json!({})),
-            Err(_) => serde_json::json!({}),
-        };
+        })).await.unwrap_or(serde_json::json!({}));
 
         if let Some(result) = check_resp.get("result") {
             let status = result.get("status").or_else(|| result.get("final_execution_status"));
             if let Some(s) = status {
                 let s_str = serde_json::to_string(s).unwrap_or_default();
                 if s_str.contains("Final") || s_str.contains("SuccessValue") {
-                    tracing::info!("TX finalized: {} (after {}s) — https://explorer.testnet.near.org/transactions/{}",
+                    tracing::info!("TX finalized: {} ({}s) — https://explorer.testnet.near.org/transactions/{}",
                         tx_hash_hex, (attempt + 1) * 2, tx_hash_hex);
                     return Ok(tx_hash_hex);
                 }
@@ -274,7 +240,6 @@ pub async fn sign_and_broadcast_async(
         }
     }
 
-    // Timeout — return hash anyway so user can check manually
     tracing::warn!("TX finality timeout (60s), hash: {}", tx_hash_hex);
     Ok(format!("{} (pending)", tx_hash_hex))
 }

@@ -112,10 +112,16 @@ struct JobParams {
 }
 
 fn deserialize_amount<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<f64, D::Error> {
-    let v: f64 = f64::deserialize(d)?;
-    if v <= 0.0 { return Err(serde::de::Error::custom("amount must be positive")); }
-    if v > 1_000_000.0 { return Err(serde::de::Error::custom("amount too large")); }
-    Ok(v)
+    // Accept both number and string (e.g. "0.001" or 0.001)
+    let v: serde_json::Value = serde_json::Value::deserialize(d)?;
+    let num: f64 = match v {
+        serde_json::Value::Number(n) => n.as_f64().ok_or_else(|| serde::de::Error::custom("invalid number"))?,
+        serde_json::Value::String(s) => s.parse().map_err(|_| serde::de::Error::custom("invalid number string"))?,
+        _ => return Err(serde::de::Error::custom("amount must be number or string")),
+    };
+    if num <= 0.0 { return Err(serde::de::Error::custom("amount must be positive")); }
+    if num > 1_000_000.0 { return Err(serde::de::Error::custom("amount too large")); }
+    Ok(num)
 }
 
 fn validate_account_name(name: &str) -> Result<String> {
