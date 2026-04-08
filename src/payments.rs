@@ -67,6 +67,10 @@ pub struct MockPaymentProvider {
     auto_approve: bool,
 }
 
+impl Default for MockPaymentProvider {
+    fn default() -> Self { Self::new() }
+}
+
 impl MockPaymentProvider {
     pub fn new() -> Self {
         Self {
@@ -124,6 +128,10 @@ pub struct FreePaymentProvider;
 
 impl FreePaymentProvider {
     pub fn new() -> Self { Self }
+}
+
+impl Default for FreePaymentProvider {
+    fn default() -> Self { Self::new() }
 }
 
 #[async_trait::async_trait]
@@ -202,7 +210,7 @@ impl PaymentProvider for NwcPaymentProvider {
             Tag::custom(TagKind::p(), [self.wallet_pubkey.to_hex()]),
         ];
 
-        let event = EventBuilder::new(Kind::Custom(23194), &request.to_string())
+        let event = EventBuilder::new(Kind::Custom(23194), request.to_string())
             .tags(tags)
             .sign_with_keys(&keys)?;
 
@@ -265,7 +273,7 @@ impl PaymentProvider for NwcPaymentProvider {
             Tag::custom(TagKind::p(), [self.wallet_pubkey.to_hex()]),
         ];
 
-        let event = EventBuilder::new(Kind::Custom(23194), &request.to_string())
+        let event = EventBuilder::new(Kind::Custom(23194), request.to_string())
             .tags(tags)
             .sign_with_keys(&keys)?;
 

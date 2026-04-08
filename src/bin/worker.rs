@@ -633,7 +633,7 @@ async fn main() -> Result<()> {
             let fd = log.into_raw_fd();
             unsafe {
                 libc::close(0); libc::close(1); libc::close(2);
-                libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_RDONLY);
+                libc::open(c"/dev/null".as_ptr() as *const i8, libc::O_RDONLY);
                 libc::dup(fd); libc::dup(fd); libc::close(fd);
             }
         }

@@ -186,7 +186,7 @@ fn parse_pk(key: &str) -> Result<PublicKey> {
 
 async fn get_nonce_blockhash(cfg: &Config, pk: &PublicKey) -> Result<(u64, CryptoHash)> {
     let access_key = Account(cfg.near_account.clone())
-        .access_key(pk.clone())
+        .access_key(*pk)
         .fetch_from(&cfg.network)
         .await
         .context("Failed to fetch access key — account may not exist or key not registered")?;

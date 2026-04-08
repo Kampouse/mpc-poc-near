@@ -86,7 +86,8 @@ pub async fn show_common_balances(cfg: &Config) -> Result<()> {
         if let Ok(balance) = get_balance(&cfg.network, &cfg.near_account, &contract).await {
             if balance > 0 {
                 let human = balance as f64 / 10u128.pow(meta.decimals as u32) as f64;
-                println!("║   {}: {:.6}", format!("{:8}", meta.symbol), human);
+                let padded = format!("{:8}", meta.symbol);
+                println!("║   {}: {:.6}", padded, human);
             }
         }
     }
