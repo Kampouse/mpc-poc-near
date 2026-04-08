@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{SigningKey, Signer as DalekSigner, VerifyingKey};
 use near_api::AccountId;
 
-pub struct Config {
-    pub nostr_sk: SigningKey,
+pub struct Config {    pub nostr_sk: SigningKey,
     pub nostr_pk: VerifyingKey,
     pub npub: String,
     pub near_account: AccountId,

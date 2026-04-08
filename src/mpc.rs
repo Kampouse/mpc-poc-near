@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use near_api::{AccountId, Contract, Signer};
-
 use crate::config::Config;
 
 const MPC_CONTRACT: &str = "v1.signer-prod.testnet";

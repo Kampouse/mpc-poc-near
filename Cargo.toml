@@ -7,6 +7,18 @@ edition = "2021"
 name = "nostr-mpc-poc"
 path = "src/main.rs"
 
+[lib]
+name = "mpc_poc_near"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mpc-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "mpc-worker"
+path = "src/bin/worker.rs"
+
 [dependencies]
 near-api = "0.8"
 tokio = { version = "1", features = ["full"] }
@@ -20,3 +32,9 @@ getrandom = "0.2"
 borsh = "1"
 sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
+nostr-sdk = "0.44"
+tokio-tungstenite = "0.26"
+futures-util = "0.3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+url = "2"
