@@ -3,10 +3,6 @@ name = "nostr-mpc-poc"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "nostr-mpc-poc"
-path = "src/main.rs"
-
 [lib]
 name = "mpc_poc_near"
 path = "src/lib.rs"
@@ -28,7 +24,6 @@ hex = "0.4"
 serde_json = "1.0"
 serde = { version = "1", features = ["derive"] }
 anyhow = "1"
-getrandom = "0.2"
 borsh = "1"
 sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
@@ -41,10 +36,6 @@ tracing-subscriber = "0.3"
 url = "2"
 shellexpand = "3"
 libc = "0.2"
-daemonize = "0.5"
-dirs = "6"
-signal-hook = "0.3"
-signal-hook-tokio = "0.3"
 reqwest = { version = "0.12", features = ["json"] }
 base64 = "0.22"
 async-trait = "0.1"

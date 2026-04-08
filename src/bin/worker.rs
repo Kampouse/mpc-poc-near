@@ -1,4 +1,4 @@
-//! MPC Worker Daemon — uses secp256k1 schnorr (NIP-01) for Nostr signatures.
+//! MPC Worker Daemon — Nostr → MPC → NEAR with Lightning payments
 //!
 //! Usage:
 //!   mpc-worker                  # foreground
@@ -7,6 +7,8 @@
 //!   mpc-worker --stop           # stop daemon
 //!
 //! Env: RELAY_URL, WORKER_NSEC, SPONSOR_KEY, SPONSOR_ACCOUNT
+//!      NWC_URL (optional, for real Lightning payments)
+//!      NO_PAYMENT (optional, skip payment entirely)
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -15,11 +17,13 @@ use nostr::key::Keys;
 use nostr::{EventBuilder, JsonUtil, Kind, Tag, TagKind};
 use serde::Deserialize;
 use sha2::Digest;
+use std::collections::HashSet;
+use std::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use mpc_poc_near::{ft, mpc, payments};
 
-// ── Clap args ────────────────────────────────────────────────────────────────
+// ── Clap ─────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(name = "mpc-worker", about = "MPC Worker Daemon")]
@@ -36,31 +40,19 @@ struct Cli {
     logfile: String,
 }
 
-fn expand(path: &str) -> String {
-    shellexpand::tilde(path).to_string()
-}
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn read_pid(path: &str) -> Option<i32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
-}
-
-fn is_running(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
-}
-
+fn expand(path: &str) -> String { shellexpand::tilde(path).to_string() }
+fn read_pid(path: &str) -> Option<i32> { std::fs::read_to_string(path).ok()?.trim().parse().ok() }
+fn is_running(pid: i32) -> bool { unsafe { libc::kill(pid, 0) == 0 } }
 fn write_pid(path: &str) -> Result<()> {
-    if let Some(dir) = std::path::Path::new(path).parent() {
-        std::fs::create_dir_all(dir)?;
-    }
+    if let Some(dir) = std::path::Path::new(path).parent() { std::fs::create_dir_all(dir)?; }
     std::fs::write(path, std::process::id().to_string())?;
     Ok(())
 }
+fn remove_pid(path: &str) { let _ = std::fs::remove_file(path); }
 
-fn remove_pid(path: &str) {
-    let _ = std::fs::remove_file(path);
-}
-
-// ── Nostr event JSON (for parsing raw relay messages) ────────────────────────
+// ── Event types ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Clone)]
 struct NostrEventJson {
@@ -76,9 +68,33 @@ struct NostrEventJson {
 #[derive(Debug, Deserialize)]
 struct JobParams {
     to: String,
-    amount: String,
+    #[serde(deserialize_with = "deserialize_amount")]
+    amount: f64,
     #[serde(rename = "token")]
     token_contract: Option<String>,
+    #[serde(rename = "account")]
+    account_name: Option<String>,
+}
+
+/// Validate amount is positive and reasonable
+fn deserialize_amount<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<f64, D::Error> {
+    let v: f64 = f64::deserialize(d)?;
+    if v <= 0.0 { return Err(serde::de::Error::custom("amount must be positive")); }
+    if v > 1_000_000.0 { return Err(serde::de::Error::custom("amount too large")); }
+    Ok(v)
+}
+
+/// Validate a NEAR account name (user-chosen)
+fn validate_account_name(name: &str) -> Result<String> {
+    // Must be 2-64 chars, lowercase alphanumeric + hyphens, ending in .testnet or .near
+    let valid = name.len() >= 2
+        && name.len() <= 64
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.' || c == '_')
+        && (name.ends_with(".testnet") || name.ends_with(".near"));
+    if !valid {
+        anyhow::bail!("Invalid account name '{}'. Use 2-64 lowercase alphanumeric/hyphen chars ending in .testnet", name);
+    }
+    Ok(name.to_string())
 }
 
 // ── Worker state ─────────────────────────────────────────────────────────────
@@ -91,6 +107,8 @@ struct Worker {
     network: near_api::NetworkConfig,
     pricing: payments::Pricing,
     payment: Box<dyn payments::PaymentProvider>,
+    /// Event IDs already processed (dedup)
+    processed: Mutex<HashSet<String>>,
 }
 
 impl Worker {
@@ -105,36 +123,36 @@ impl Worker {
             .context("Set SPONSOR_ACCOUNT")?.parse().context("Invalid SPONSOR_ACCOUNT")?;
         let network = near_api::NetworkConfig::from_rpc_url("testnet", "https://rpc.testnet.near.org".parse()?);
 
-        // Set up payment provider
         let payment: Box<dyn payments::PaymentProvider> = if std::env::var("NWC_URL").is_ok() {
-            println!("Using NIP-47 (NWC) payment provider");
+            tracing::info!("Payment: NIP-47 (NWC)");
             Box::new(payments::NwcPaymentProvider::from_env()?)
         } else if std::env::var("NO_PAYMENT").is_ok() {
-            println!("Payment disabled (NO_PAYMENT set) — free processing");
+            tracing::info!("Payment: disabled (free mode)");
             Box::new(payments::FreePaymentProvider::new())
         } else {
-            println!("Using mock payment provider (auto-approves all payments)");
+            tracing::info!("Payment: mock (auto-approve)");
             Box::new(payments::MockPaymentProvider::auto_approving())
         };
 
-        Ok(Self { relay_url, keys, sponsor_key, sponsor_account, network, pricing: payments::Pricing::default(), payment })
+        Ok(Self {
+            relay_url, keys, sponsor_key, sponsor_account, network,
+            pricing: payments::Pricing::default(),
+            payment,
+            processed: Mutex::new(HashSet::new()),
+        })
+    }
+
+    /// Check if we've already processed this event (dedup)
+    fn is_duplicate(&self, event_id: &str) -> bool {
+        self.processed.lock().unwrap().insert(event_id.to_string())
+            == false // insert returns false if already present
     }
 
     async fn run(&self, pidfile: &str) -> Result<()> {
         write_pid(pidfile)?;
-
         let npub = self.keys.public_key().to_hex();
-        println!("╔══════════════════════════════════════════════════╗");
-        println!("║   MPC Worker Daemon                              ║");
-        println!("╠══════════════════════════════════════════════════╣");
-        println!("║   Relay:   {}", self.relay_url);
-        println!("║   Worker:  {}...{}", &npub[..16], &npub[npub.len()-8..]);
-        println!("║   Sponsor: {}", self.sponsor_account);
-        println!("║   PID:     {}", std::process::id());
-        println!("║   PIDfile: {}", pidfile);
-        println!("║                                                  ║");
-        println!("║   Listening for kind 5000 (register) & 5001 (transfer) events  ║");
-        println!("╚══════════════════════════════════════════════════╝\n");
+        tracing::info!("Worker started: {}...{}", &npub[..16], &npub[npub.len()-8..]);
+        tracing::info!("Relay: {} | Sponsor: {}", self.relay_url, self.sponsor_account);
 
         loop {
             if let Err(e) = self.connect_and_process().await {
@@ -149,12 +167,12 @@ impl Worker {
     async fn connect_and_process(&self) -> Result<()> {
         let (mut ws, _) = connect_async(&self.relay_url).await
             .with_context(|| format!("Failed to connect to {}", self.relay_url))?;
-        println!("✅ Connected to relay");
+        tracing::info!("Connected to relay");
 
         let sub_id = format!("mpc-{}", &self.keys.public_key().to_hex()[..8]);
         let req = serde_json::json!(["REQ", sub_id, {"kinds": [5000, 5001], "limit": 100}]).to_string();
         ws.send(Message::Text(req.into())).await?;
-        println!("📡 Subscribed to kind 5000 (register) & 5001 (transfer) events\n");
+        tracing::info!("Subscribed to kind 5000 (register) & 5001 (transfer)");
 
         while let Some(msg) = ws.next().await {
             match msg {
@@ -175,26 +193,29 @@ impl Worker {
     async fn handle_message(&self, text: &str) -> Result<()> {
         let parsed: Vec<serde_json::Value> = serde_json::from_str(text)?;
         match parsed.first().and_then(|v| v.as_str()).unwrap_or("") {
-            "EVENT" if parsed.len() >= 3 => {
-                self.handle_event(&parsed[2]).await?;
-            }
-            "EOSE" => println!("📋 Caught up. Listening for new events...\n"),
-            "NOTICE" => println!("📢 {}", parsed.get(1).and_then(|v| v.as_str()).unwrap_or("")),
+            "EVENT" if parsed.len() >= 3 => { self.handle_event(&parsed[2]).await?; }
+            "EOSE" => tracing::info!("Caught up, listening..."),
+            "NOTICE" => tracing::warn!("Relay notice: {}", parsed.get(1).and_then(|v| v.as_str()).unwrap_or("")),
             _ => {}
         }
         Ok(())
     }
 
     async fn handle_event(&self, event_json: &serde_json::Value) -> Result<()> {
-        // Parse via nostr-sdk for proper secp256k1 verification
         let event: nostr::Event = nostr::Event::from_json(event_json.to_string())
             .context("Failed to parse Nostr event")?;
-
         let kind = event.kind.as_u16();
-        let pk_hex = event.pubkey.to_hex();
+        let event_id = event.id.to_hex();
 
+        // Dedup
+        if self.is_duplicate(&event_id) {
+            tracing::debug!("Skipping duplicate event {}", &event_id[..16]);
+            return Ok(());
+        }
+
+        let pk_hex = event.pubkey.to_hex();
         match kind {
-            5000 => self.handle_registration(&event, &pk_hex).await,
+            5000 => self.handle_registration(&event, &pk_hex, event_json).await,
             5001 => self.handle_transfer(&event, &pk_hex, event_json).await,
             _ => Ok(()),
         }
@@ -202,56 +223,59 @@ impl Worker {
 
     // ── Registration (kind 5000) ────────────────────────────────────────────
 
-    async fn handle_registration(&self, event: &nostr::Event, pk_hex: &str) -> Result<()> {
-        println!("📨 Register from {}...{}", &pk_hex[..16], &pk_hex[pk_hex.len()-8..]);
-
-        // 1. Verify signature
+    async fn handle_registration(
+        &self,
+        event: &nostr::Event,
+        pk_hex: &str,
+        event_json: &serde_json::Value,
+    ) -> Result<()> {
         if !event.verify_signature() {
-            tracing::warn!("Invalid signature from {}", &pk_hex[..16]);
             self.publish_feedback(event, "error", "Invalid signature").await?;
             return Ok(());
         }
-        println!("   ✅ Signature valid");
 
-        // 2. Derive the MPC key for this Nostr identity
+        // Derive MPC key
         let path = format!("nostr:{}", pk_hex);
         let near_public_key = mpc::derive_public_key(&path, self.sponsor_account.as_str(), &self.network).await?;
-        println!("   🔑 MPC key: {}...", &near_public_key[..40.min(near_public_key.len())]);
 
-        // 3. Create a NEAR account for this user
-        // Account name: nostr-<first 12 hex chars of npub>.testnet
-        let account_name = format!("n{}-{}.testnet", &pk_hex[..4], &pk_hex[4..12]);
-        let account_id: near_api::AccountId = account_name.parse()
-            .context("Invalid derived account name")?;
+        // Parse desired account name from content, or derive from npub
+        let raw: NostrEventJson = serde_json::from_value(event_json.clone())?;
+        let account_name = match parse_account_name(&raw) {
+            Some(name) => match validate_account_name(&name) {
+                Ok(n) => n,
+                Err(e) => {
+                    self.publish_feedback(event, "error", &e.to_string()).await?;
+                    return Ok(());
+                }
+            },
+            None => format!("n{}-{}.testnet", &pk_hex[..4], &pk_hex[4..12]),
+        };
+
+        let account_id: near_api::AccountId = match account_name.parse() {
+            Ok(id) => id,
+            Err(e) => {
+                self.publish_feedback(event, "error", &format!("Invalid account name: {}", e)).await?;
+                return Ok(());
+            }
+        };
+
+        tracing::info!("Register: {} → {} (key: {}...)", &pk_hex[..16], account_id, &near_public_key[..24]);
 
         match self.create_account(&account_id, &near_public_key).await {
-            Ok(_) => {
-                let msg = format!(
-                    "account:{}|key:{}|path:{}",
-                    account_id, near_public_key, path
-                );
+            Ok(()) => {
+                let msg = format!("account:{}|key:{}|path:{}", account_id, near_public_key, path);
                 self.publish_feedback(event, "success", &msg).await?;
-                println!("   ✅ Registered: {}", account_id);
             }
             Err(e) => {
                 let err_str = format!("{}", e);
                 if err_str.contains("AlreadyExists") || err_str.contains("already") {
-                    // Account exists, just return the info
-                    let msg = format!(
-                        "account:{}|key:{}|path:{}|status:exists",
-                        account_id, near_public_key, path
-                    );
+                    let msg = format!("account:{}|key:{}|path:{}|status:exists", account_id, near_public_key, path);
                     self.publish_feedback(event, "success", &msg).await?;
-                    println!("   ℹ️  Already registered: {}", account_id);
                 } else {
-                    let msg = format!("Registration failed: {}", e);
-                    tracing::error!("{}", msg);
-                    self.publish_feedback(event, "error", &msg).await?;
+                    self.publish_feedback(event, "error", &format!("Registration failed: {}", e)).await?;
                 }
             }
         }
-
-        println!();
         Ok(())
     }
 
@@ -267,8 +291,6 @@ impl Worker {
         let signer = Signer::from_secret_key(self.sponsor_key.parse()?)?;
         let pk = PublicKey::from_str(public_key)?;
 
-        println!("   Creating {} with MPC-derived key...", account_id);
-
         let result = Account::create_account(account_id.clone())
             .fund_myself(self.sponsor_account.clone(), NearToken::from_near(0))
             .with_public_key(pk)
@@ -283,44 +305,55 @@ impl Worker {
 
     // ── Transfer (kind 5001) ────────────────────────────────────────────────
 
-    async fn handle_transfer(&self, event: &nostr::Event, pk_hex: &str, event_json: &serde_json::Value) -> Result<()> {
-        println!("📨 Transfer from {}...{}", &pk_hex[..16], &pk_hex[pk_hex.len()-8..]);
-        println!("   Content: {}", &event.content[..100.min(event.content.len())]);
-
-        // 1. Verify signature (secp256k1 schnorr)
+    async fn handle_transfer(
+        &self,
+        event: &nostr::Event,
+        pk_hex: &str,
+        event_json: &serde_json::Value,
+    ) -> Result<()> {
         if !event.verify_signature() {
-            tracing::warn!("Invalid signature from {}", &pk_hex[..16]);
             self.publish_feedback(event, "error", "Invalid signature").await?;
             return Ok(());
         }
-        println!("   ✅ Signature valid (secp256k1 schnorr)");
 
-        // 2. Check for payment_hash tag (user has paid)
+        // Parse job with validation
+        let raw: NostrEventJson = serde_json::from_value(event_json.clone())?;
+        let params = match parse_job(&raw) {
+            Ok(p) => p,
+            Err(e) => {
+                self.publish_feedback(event, "error", &format!("Invalid job params: {}", e)).await?;
+                return Ok(());
+            }
+        };
+
+        // Validate recipient
+        let to_id: near_api::AccountId = match params.to.parse() {
+            Ok(id) => id,
+            Err(e) => {
+                self.publish_feedback(event, "error", &format!("Invalid recipient '{}': {}", params.to, e)).await?;
+                return Ok(());
+            }
+        };
+
+        let token = params.token_contract.as_deref().unwrap_or("NEAR");
+
+        // Check for payment_hash tag
         let payment_hash_tag = event.tags.iter()
             .find(|t| t.kind() == TagKind::custom("payment_hash"))
             .and_then(|t| t.content());
 
-        // 3. Parse job to calculate price
-        let raw: NostrEventJson = serde_json::from_value(event_json.clone())?;
-        let params = parse_job(&raw)?;
-        let token = params.token_contract.as_deref().unwrap_or("NEAR");
-        println!("   📋 Send {} {} to {}", params.amount, token, params.to);
-
-        // 4. Payment check
         if let Some(ph) = payment_hash_tag {
-            // User claims to have paid — verify
+            // Verify payment
             match self.payment.check_payment(ph).await {
                 Ok(payments::PaymentStatus::Paid) => {
-                    println!("   ✅ Payment confirmed: {}...", &ph[..16]);
+                    tracing::info!("Payment confirmed: {}...", &ph[..16]);
                 }
                 Ok(payments::PaymentStatus::Expired) => {
                     self.publish_feedback(event, "error", "Payment expired").await?;
                     return Ok(());
                 }
                 Ok(payments::PaymentStatus::Pending) => {
-                    self.publish_feedback(event, "error", &format!(
-                        "Payment not confirmed yet: {}", ph
-                    )).await?;
+                    self.publish_feedback(event, "error", &format!("Payment not confirmed: {}", ph)).await?;
                     return Ok(());
                 }
                 Err(e) => {
@@ -329,17 +362,14 @@ impl Worker {
                 }
             }
         } else {
-            // No payment yet — calculate price and request payment
-            let amount: f64 = params.amount.parse().unwrap_or(0.0);
+            // Create invoice
             let price_sats = if token == "NEAR" {
-                self.pricing.price_transfer(amount)
+                self.pricing.price_transfer(params.amount)
             } else {
                 self.pricing.price_ft_transfer()
             };
 
-            println!("   💰 Price: {} sats", price_sats);
-            let desc = format!("NEAR transfer: {} {} to {}", params.amount, token, params.to);
-
+            let desc = format!("NEAR: {} {} → {}", params.amount, token, to_id);
             match self.payment.create_invoice(price_sats, &desc).await {
                 Ok(invoice) => {
                     let msg = format!(
@@ -347,43 +377,41 @@ impl Worker {
                         invoice.bolt11, invoice.amount_sats, invoice.payment_hash, invoice.expires_at,
                     );
                     self.publish_feedback(event, "payment_required", &msg).await?;
-                    println!("   📤 Invoice sent: {} sats", price_sats);
                     return Ok(());
                 }
                 Err(e) => {
-                    self.publish_feedback(event, "error", &format!("Failed to create invoice: {}", e)).await?;
+                    self.publish_feedback(event, "error", &format!("Invoice failed: {}", e)).await?;
                     return Ok(());
                 }
             }
         }
 
-        // 5. Payment confirmed — execute the transfer
+        // Payment confirmed — execute transfer
         let path = format!("nostr:{}", pk_hex);
-        let mpc_key = mpc::derive_public_key(&path, self.sponsor_account.as_str(), &self.network).await?;
-        println!("   🔑 MPC key: {}...", &mpc_key[..40.min(mpc_key.len())]);
+        let account_name = match &params.account_name {
+            Some(name) => validate_account_name(name)?,
+            None => format!("n{}-{}.testnet", &pk_hex[..4], &pk_hex[4..12]),
+        };
 
-        match self.execute_transfer(&params, &pk_hex).await {
+        match self.execute_transfer(&params, &account_name, &path, &pk_hex).await {
             Ok(tx_hash) => {
-                self.publish_feedback(event, "success", &format!(
-                    "Sent {} {} to {} | tx: {}",
-                    params.amount, token, params.to, tx_hash
-                )).await?;
+                let msg = format!("Sent {} {} to {} | tx: {}", params.amount, token, to_id, tx_hash);
+                self.publish_feedback(event, "success", &msg).await?;
             }
             Err(e) => {
-                let msg = format!("Failed: {}", e);
-                tracing::error!("{}", msg);
-                self.publish_feedback(event, "error", &msg).await?;
+                tracing::error!("Transfer failed: {}", e);
+                self.publish_feedback(event, "error", &format!("Failed: {}", e)).await?;
             }
         }
-
-        println!("   ✅ Processed\n");
         Ok(())
     }
 
     async fn execute_transfer(
         &self,
         params: &JobParams,
-        sender_pk_hex: &str,
+        account_name: &str,
+        path: &str,
+        _sender_pk_hex: &str,
     ) -> Result<String> {
         use near_api::types::transaction::actions::{FunctionCallAction, TransferAction};
         use near_api::types::transaction::{Transaction, TransactionV0};
@@ -391,41 +419,28 @@ impl Worker {
         use near_api::Account;
         use std::str::FromStr;
 
-        let path = format!("nostr:{}", sender_pk_hex);
-        let near_public_key = mpc::derive_public_key(&path, self.sponsor_account.as_str(), &self.network).await?;
-
-        // Resolve the sender's NEAR account from the nostr pubkey binding
-        // For now, we use the pubkey hex as account lookup
-        // TODO: maintain a nostr_pubkey → NEAR account mapping
-        // Derive account name from pubkey (must match registration naming)
-        let account_name = format!("n{}-{}.testnet", &sender_pk_hex[..4], &sender_pk_hex[4..12]);
+        let near_public_key = mpc::derive_public_key(path, self.sponsor_account.as_str(), &self.network).await?;
         let sender_account: near_api::AccountId = account_name.parse()
             .context("Invalid derived account")?;
-
         let to_id: near_api::AccountId = params.to.parse()
-            .context("Invalid recipient in job")?;
+            .context("Invalid recipient")?;
         let pk = PublicKey::from_str(&near_public_key)?;
+        let sender_id_for_mpc = sender_account.clone();
 
-        // Get nonce + block hash for the MPC-derived key
+        // Get nonce + block hash
         let access_key = Account(sender_account.clone())
             .access_key(pk.clone())
             .fetch_from(&self.network)
             .await
-            .context("Failed to fetch access key — account may not exist")?;
+            .context("Failed to fetch access key — account may not exist or key not registered")?;
         let nonce = access_key.data.nonce.0;
         let block_hash = access_key.block_hash;
 
-        // Parse amount
-        let amount: f64 = params.amount.parse().context("Invalid amount")?;
-
-        // Build unsigned tx based on token type
         let unsigned_tx = match &params.token_contract {
             None => {
-                // NEAR transfer
-                let amount_yocto = (amount * 1e24) as u128;
-                println!("   Building NEAR transfer: {} → {} ({} NEAR)", sender_account, to_id, amount);
+                let amount_yocto = (params.amount * 1e24) as u128;
                 Transaction::V0(TransactionV0 {
-                    signer_id: sender_account.clone(),
+                    signer_id: sender_account,
                     public_key: pk,
                     nonce: nonce + 1,
                     receiver_id: to_id,
@@ -436,21 +451,13 @@ impl Worker {
                 })
             }
             Some(contract_id) => {
-                // FT transfer
                 let contract: near_api::AccountId = contract_id.parse()
                     .with_context(|| format!("Invalid FT contract: {}", contract_id))?;
                 let meta = ft::get_metadata(&self.network, &contract).await?;
-                let raw_amount = (amount * 10f64.powi(meta.decimals as i32)) as u128;
-                println!("   Building FT transfer: {} {} ({}) → {}",
-                         amount, meta.symbol, raw_amount, to_id);
-
-                let ft_args = serde_json::json!({
-                    "receiver_id": to_id.as_str(),
-                    "amount": raw_amount.to_string(),
-                });
-
+                let raw_amount = (params.amount * 10f64.powi(meta.decimals as i32)) as u128;
+                let ft_args = serde_json::json!({"receiver_id": to_id.as_str(), "amount": raw_amount.to_string()});
                 Transaction::V0(TransactionV0 {
-                    signer_id: sender_account.clone(),
+                    signer_id: sender_account,
                     public_key: pk,
                     nonce: nonce + 1,
                     receiver_id: contract,
@@ -468,24 +475,17 @@ impl Worker {
             }
         };
 
-        // Serialize and hash
+        // Serialize, hash, sign via MPC, broadcast
         let tx_bytes = borsh::to_vec(&unsigned_tx)?;
         let tx_hash: [u8; 32] = sha2::Sha256::digest(&tx_bytes).into();
-        println!("   TX hash: {}", hex::encode(tx_hash));
 
-        // Call MPC to sign + broadcast
-        let tx_hash = mpc::sign_and_broadcast(
-            &unsigned_tx,
-            &tx_hash,
-            &path,
-            sender_account.as_str(),
-            &self.sponsor_account,
-            &self.sponsor_key,
-            &self.network,
-        ).await?;
-
-        Ok(tx_hash)
+        mpc::sign_and_broadcast(
+            &unsigned_tx, &tx_hash, path,
+            sender_id_for_mpc.as_str(), &self.sponsor_account, &self.sponsor_key, &self.network,
+        ).await
     }
+
+    // ── Feedback ────────────────────────────────────────────────────────────
 
     async fn publish_feedback(&self, original: &nostr::Event, status: &str, msg: &str) -> Result<()> {
         let tags = vec![
@@ -498,11 +498,9 @@ impl Worker {
             .tags(tags)
             .sign_with_keys(&self.keys)?;
 
-        let event_json = serde_json::to_string(&serde_json::json!(["EVENT", event]))?;
-
         let (mut ws, _) = connect_async(&self.relay_url).await?;
-        ws.send(Message::Text(event_json.into())).await?;
-        println!("   📤 Feedback: [{}]", status);
+        ws.send(Message::Text(serde_json::json!(["EVENT", event]).to_string().into())).await?;
+        tracing::info!("Feedback [{}]: {}", status, &msg[..80.min(msg.len())]);
         Ok(())
     }
 }
@@ -510,12 +508,25 @@ impl Worker {
 // ── Job parsing ──────────────────────────────────────────────────────────────
 
 fn parse_job(event: &NostrEventJson) -> Result<JobParams> {
+    // Try 'i' tags first
     for tag in &event.tags {
         if tag.len() >= 2 && tag[0] == "i" {
             if let Ok(p) = serde_json::from_str::<JobParams>(&tag[1]) { return Ok(p); }
         }
     }
+    // Fallback to content
     serde_json::from_str(&event.content).with_context(|| format!("Cannot parse job from {}", event.id))
+}
+
+fn parse_account_name(event: &NostrEventJson) -> Option<String> {
+    for tag in &event.tags {
+        if tag.len() >= 2 && tag[0] == "n" { return Some(tag[1].clone()); }
+    }
+    // Check content for "account:<name>"
+    if event.content.starts_with("account:") {
+        return Some(event.content[8..].trim().to_string());
+    }
+    None
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -548,14 +559,10 @@ async fn main() -> Result<()> {
                     }
                     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
                 }
-                println!("⚠️  Force killing...");
                 unsafe { libc::kill(pid, libc::SIGKILL) };
                 remove_pid(&pidfile);
             }
-            Some(pid) => {
-                println!("PID {} not running (cleaning up)", pid);
-                remove_pid(&pidfile);
-            }
+            Some(pid) => { println!("PID {} not running (cleaning up)", pid); remove_pid(&pidfile); }
             None => println!("Not running"),
         }
         return Ok(());
@@ -568,32 +575,22 @@ async fn main() -> Result<()> {
             pid => {
                 println!("Daemon started (PID {})", pid);
                 std::thread::sleep(std::time::Duration::from_secs(1));
-                if let Some(_pid) = read_pid(&pidfile) {
-                    println!("PID file: {}", pidfile);
-                }
                 return Ok(());
             }
         }
-
         unsafe { libc::setsid(); }
-
         if let Ok(log) = std::fs::File::options().create(true).append(true).open(&logfile) {
             use std::os::unix::io::IntoRawFd;
             let fd = log.into_raw_fd();
             unsafe {
-                libc::close(0);
-                libc::close(1);
-                libc::close(2);
+                libc::close(0); libc::close(1); libc::close(2);
                 libc::open(b"/dev/null\0".as_ptr() as *const i8, libc::O_RDONLY);
-                libc::dup(fd);
-                libc::dup(fd);
-                libc::close(fd);
+                libc::dup(fd); libc::dup(fd); libc::close(fd);
             }
         }
     }
 
     tracing_subscriber::fmt::init();
-
     let worker = Worker::from_env()?;
     worker.run(&pidfile).await
 }

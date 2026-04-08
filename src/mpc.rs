@@ -30,7 +30,6 @@ pub async fn derive_public_key(
         .context("MPC derived_public_key call failed")?;
 
     let raw = derived.data.as_str().context("MPC returned non-string")?;
-
     if raw.starts_with("ed25519:") {
         Ok(raw.to_string())
     } else {
@@ -39,15 +38,16 @@ pub async fn derive_public_key(
     }
 }
 
-/// Convenience: derive key using Config
+/// Convenience: derive key using Config (CLI use)
+#[allow(dead_code)]
 pub async fn derive_key_for_config(cfg: &Config) -> Result<String> {
     derive_public_key(&cfg.mpc_path, cfg.near_account.as_str(), &cfg.network).await
 }
 
-/// MPC signature response (from the sign call via yield-resume)
-/// The MPC contract returns: {"scheme": "Ed25519", "signature": [u8; 64]}
+/// MPC signature response: {"scheme": "Ed25519", "signature": [u8; 64]}
 #[derive(Debug, Deserialize)]
 pub struct SignResult {
+    #[allow(dead_code)]
     pub scheme: String,
     pub signature: Vec<u8>,
 }
@@ -62,9 +62,7 @@ pub async fn sign_payload(
     network: &near_api::NetworkConfig,
 ) -> Result<SignResult> {
     let signer = Signer::from_secret_key(sponsor_key.parse()?)?;
-    let payload_vec: Vec<u8> = payload.to_vec();
-
-    println!("   Calling MPC.sign(path={}, sponsor={})...", path, sponsor_id);
+    tracing::info!("MPC.sign(path={}, sponsor={})", path, sponsor_id);
 
     let result = Contract(mpc_account()?)
         .call_function("sign", serde_json::json!({
@@ -85,18 +83,9 @@ pub async fn sign_payload(
     let exec_result = result.into_result()
         .map_err(|e| anyhow::anyhow!("MPC execution failed: {:?}", e))?;
 
-    // Debug: log what we got back
-    if let Ok(bytes) = exec_result.raw_bytes() {
-        println!("   MPC raw bytes ({}): {:?}...", bytes.len(), &bytes[..bytes.len().min(32)]);
-    }
-    if let Ok(val) = exec_result.json::<serde_json::Value>() {
-        println!("   MPC JSON: {:?}", val);
-    }
-
-    // The MPC contract returns JSON: {"scheme":"Ed25519","signature":[u8;64]}
     match exec_result.json::<SignResult>() {
         Ok(sig) => {
-            println!("   ✅ MPC signature received ({} bytes, scheme={})", sig.signature.len(), sig.scheme);
+            tracing::info!("MPC signature received ({} bytes)", sig.signature.len());
             Ok(sig)
         }
         Err(e) => {
@@ -104,50 +93,42 @@ pub async fn sign_payload(
                 .context("No return data from MPC sign")?;
             let sig: SignResult = serde_json::from_slice(&bytes)
                 .context(format!("Cannot parse MPC sign result (json err: {:?})", e))?;
-            println!("   ✅ MPC signature received (fallback parse, {} bytes)", sig.signature.len());
+            tracing::info!("MPC signature received via fallback ({} bytes)", sig.signature.len());
             Ok(sig)
         }
     }
 }
 
-/// Legacy: sign via Config (CLI use)
+/// Sign via Config (CLI use)
+#[allow(dead_code)]
 pub async fn sign_payload_with_config(cfg: &Config, payload: &[u8; 32]) -> Result<SignResult> {
     let (sponsor_id, sponsor_key) = cfg.require_sponsor()?;
-    sign_payload(
-        payload,
-        &cfg.mpc_path,
-        cfg.near_account.as_str(),
-        sponsor_id,
-        sponsor_key,
-        &cfg.network,
-    ).await
+    sign_payload(payload, &cfg.mpc_path, cfg.near_account.as_str(), sponsor_id, sponsor_key, &cfg.network).await
 }
 
-/// Assemble a signed NEAR transaction from unsigned tx + ed25519 signature bytes and broadcast it.
+/// Assemble signed tx and broadcast via RPC.
 pub async fn assemble_and_broadcast(
     unsigned_tx: &Transaction,
     signature_bytes: &[u8],
     network: &near_api::NetworkConfig,
 ) -> Result<String> {
-    use borsh::BorshSerialize;
-
-    // Construct NEAR Signature from ed25519 bytes
     let sig = Signature::from_parts(
         near_api::types::crypto::KeyType::ED25519,
         signature_bytes,
     ).context("Invalid ed25519 signature bytes")?;
 
-    // Build the signed transaction
     let signed_tx = SignedTransaction::new(sig, unsigned_tx.clone());
     let tx_hash = signed_tx.get_hash();
     let tx_hash_hex = tx_hash.to_string();
-    println!("   Signed TX hash: {}", tx_hash_hex);
+    tracing::info!("Signed TX hash: {}", tx_hash_hex);
 
-    // Serialize signed tx to base64 for broadcast
     let tx_borsh = borsh::to_vec(&signed_tx)?;
     let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_borsh);
 
-    // Broadcast via JSON-RPC
+    let rpc_url = network.rpc_endpoints.first()
+        .map(|e| e.url.to_string())
+        .unwrap_or_else(|| "https://rpc.testnet.near.org".to_string());
+
     let rpc_body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": "0",
@@ -155,13 +136,7 @@ pub async fn assemble_and_broadcast(
         "params": [tx_b64]
     });
 
-    // Get the RPC URL from the network config
-    let rpc_url = network.rpc_endpoints.first()
-        .map(|e| e.url.to_string())
-        .unwrap_or_else(|| "https://rpc.testnet.near.org".to_string());
-
-    println!("   Broadcasting to {}...", rpc_url);
-
+    tracing::info!("Broadcasting to {}", rpc_url);
     let client = reqwest::Client::new();
     let resp: serde_json::Value = client
         .post(&rpc_url)
@@ -177,22 +152,18 @@ pub async fn assemble_and_broadcast(
         anyhow::bail!("RPC error: {:?}", error);
     }
 
-    let result = resp.get("result")
-        .context("No result in RPC response")?;
-
+    let result = resp.get("result").context("No result in RPC response")?;
     let final_hash = result.get("transaction_outcome")
         .and_then(|r| r.get("id"))
         .and_then(|id| id.as_str())
         .unwrap_or(&tx_hash_hex)
         .to_string();
 
-    println!("   ✅ TX finalized: {}", final_hash);
-    println!("   Explorer: https://explorer.testnet.near.org/transactions/{}", final_hash);
-
+    tracing::info!("TX finalized: {} — https://explorer.testnet.near.org/transactions/{}", final_hash, final_hash);
     Ok(final_hash)
 }
 
-/// Full pipeline: sign + broadcast
+/// Full pipeline: MPC sign → assemble → broadcast
 pub async fn sign_and_broadcast(
     unsigned_tx: &Transaction,
     payload: &[u8; 32],
@@ -203,10 +174,8 @@ pub async fn sign_and_broadcast(
     network: &near_api::NetworkConfig,
 ) -> Result<String> {
     let sign_result = sign_payload(payload, path, predecessor, sponsor_id, sponsor_key, network).await?;
-
     if sign_result.signature.len() != 64 {
         anyhow::bail!("Expected 64-byte ed25519 signature, got {} bytes", sign_result.signature.len());
     }
-
     assemble_and_broadcast(unsigned_tx, &sign_result.signature, network).await
 }

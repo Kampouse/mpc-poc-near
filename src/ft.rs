@@ -76,7 +76,8 @@ const COMMON_TOKENS: &[&str] = &[
 /// Show balances for common tokens (non-zero only).
 pub async fn show_common_balances(cfg: &Config) -> Result<()> {
     for contract_id in COMMON_TOKENS {
-        let contract: AccountId = contract_id.parse().unwrap();
+        let contract: AccountId = contract_id.parse()
+            .with_context(|| format!("Invalid FT contract ID: {}", contract_id))?;
         if let Ok(balance) = get_balance(&cfg.network, &cfg.near_account, &contract).await {
             if balance > 0 {
                 if let Ok(meta) = get_metadata(&cfg.network, &contract).await {
