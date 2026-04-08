@@ -2,8 +2,10 @@
 //!
 //! Commands:
 //!   info                          - Account & MPC info
-//!   balances                      - All token balances (NEAR + FTs)
-//!   transfer <to> <amount> [token] - Send NEAR or FT
+//!   balances                      - NEAR balance + auto-discovered FTs
+//!   balance <contract_id>         - Check specific FT balance
+//!   transfer <to> <amount> [contract_id] - Send NEAR or any FT
+//!   create                        - Create NEAR account with MPC key
 //!   sign-test                     - Test Nostr signature
 //!
 //! Env: NOSTR_SK, NEAR_ACCOUNT, SPONSOR_KEY, SPONSOR_ACCOUNT
@@ -14,33 +16,60 @@ use near_api::types::transaction::actions::{FunctionCallAction, TransferAction};
 use near_api::types::transaction::{Transaction, TransactionV0};
 use near_api::types::{Action, CryptoHash, PublicKey};
 use near_api::{Account, AccountId, Contract, NearGas, NearToken, NetworkConfig, Signer};
+use std::str::FromStr;
 use sha2::{Sha256, Digest};
 
 const MPC_CONTRACT: &str = "v1.signer-prod.testnet";
-
-/// Known FT tokens on testnet (add more as needed)
-const KNOWN_TOKENS: &[(&str, &str, u8)] = &[
-    // (contract_id, symbol, decimals)
-    ("usdt.fakes.testnet", "USDT", 6),
-    ("usdc.fakes.testnet", "USDC", 6),
-    ("wrap.testnet", "wNEAR", 24),
-    ("token.v2.ref-finance.testnet", "REF", 18),
-];
-
-// For mainnet, use:
-// const KNOWN_TOKENS: &[(&str, &str, u8)] = &[
-//     ("usdt.tether-token.near", "USDT", 6),
-//     ("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.factory.bridge.near", "USDC", 6),
-//     ("wrap.near", "wNEAR", 24),
-//     ("token.v2.ref-finance.near", "REF", 18),
-//     ("berryclub.ek.near", "BANANA", 18),
-// ];
 
 fn hex_to_bytes(hex: &str) -> Vec<u8> {
     (0..hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
         .collect()
+}
+
+/// Query FT metadata from any NEAR token contract (ft_metadata standard).
+async fn get_ft_metadata(
+    network: &NetworkConfig,
+    contract_id: &AccountId,
+) -> Option<FtMetadata> {
+    let result: near_api::Data<serde_json::Value> = Contract(contract_id.clone())
+        .call_function("ft_metadata", serde_json::json!({}))
+        .read_only()
+        .fetch_from(network)
+        .await
+        .ok()?;
+
+    let data = result.data;
+    Some(FtMetadata {
+        symbol: data.get("symbol")?.as_str()?.to_string(),
+        decimals: data.get("decimals")?.as_u64()? as u8,
+        name: data.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+    })
+}
+
+struct FtMetadata {
+    symbol: String,
+    decimals: u8,
+    name: String,
+}
+
+/// Query FT balance from any contract.
+async fn query_ft_balance(
+    network: &NetworkConfig,
+    account_id: &AccountId,
+    contract_id: &AccountId,
+) -> Option<u128> {
+    let result: near_api::Data<serde_json::Value> = Contract(contract_id.clone())
+        .call_function("ft_balance_of", serde_json::json!({
+            "account_id": account_id.as_str(),
+        }))
+        .read_only()
+        .fetch_from(network)
+        .await
+        .ok()?;
+
+    result.data.as_str().and_then(|s| s.parse::<u128>().ok())
 }
 
 #[tokio::main]
@@ -67,23 +96,28 @@ async fn main() -> anyhow::Result<()> {
     match cmd {
         "info" => cmd_info(&network, &account_id, &npub, &path, &near_public_key).await?,
         "balances" => cmd_balances(&network, &account_id).await?,
-        "balance" => cmd_balances(&network, &account_id).await?,
-        "transfer" => {
-            // transfer <to> <amount> [token_symbol]
-            let to = args.get(2).ok_or(anyhow::anyhow!("Usage: transfer <to> <amount> [token]"))?;
-            let amt_str = args.get(3).ok_or(anyhow::anyhow!("Usage: transfer <to> <amount> [token]"))?;
-            let token = args.get(4).map(|s| s.as_str()); // optional, defaults to NEAR
-            cmd_transfer(&network, &account_id, &path, &near_public_key, &nostr_sk, to, amt_str, token).await?;
+        "balance" => {
+            // balance <contract_id>
+            let contract = args.get(2).ok_or(anyhow::anyhow!("Usage: balance <contract_id>"))?;
+            cmd_balance_single(&network, &account_id, contract).await?;
         }
+        "transfer" => {
+            let to = args.get(2).ok_or(anyhow::anyhow!("Usage: transfer <to> <amount> [contract_id]"))?;
+            let amt_str = args.get(3).ok_or(anyhow::anyhow!("Usage: transfer <to> <amount> [contract_id]"))?;
+            let token_contract = args.get(4); // optional contract_id, defaults to NEAR
+            cmd_transfer(&network, &account_id, &path, &near_public_key, &nostr_sk, to, amt_str, token_contract).await?;
+        }
+        "create" => cmd_create(&network, &account_id, &path, &near_public_key).await?,
         "sign-test" => cmd_sign_test(&nostr_sk)?,
         _ => {
             println!("Commands:");
-            println!("  info                          - Account & MPC info");
-            println!("  balances                      - All token balances");
-            println!("  transfer <to> <amount> [token]- Send NEAR or token");
-            println!("  sign-test                     - Test Nostr signature");
-            println!();
-            println!("Tokens: NEAR (default), USDT, USDC, wNEAR, REF");
+            println!("  info                              - Account & MPC info");
+            println!("  balances                          - NEAR + auto-discovered FTs");
+            println!("  balance <contract_id>             - Specific FT balance");
+            println!("  transfer <to> <amount>            - Send NEAR");
+            println!("  transfer <to> <amount> <contract> - Send any FT token");
+            println!("  create                            - Create account with MPC key");
+            println!("  sign-test                         - Test Nostr signature");
         }
     }
     Ok(())
@@ -106,7 +140,7 @@ async fn derive_mpc_key(network: &NetworkConfig, account_id: &AccountId, path: &
 
 async fn cmd_balances(network: &NetworkConfig, account_id: &AccountId) -> anyhow::Result<()> {
     println!("╔══════════════════════════════════════════════════╗");
-    println!("║   Balances for {}      ", account_id);
+    println!("║   Balances for {}", account_id);
     println!("╠══════════════════════════════════════════════════╣");
 
     // NEAR balance
@@ -115,46 +149,66 @@ async fn cmd_balances(network: &NetworkConfig, account_id: &AccountId) -> anyhow
             let near_bal = s.data.amount.as_yoctonear() as f64 / 1e24;
             println!("║   NEAR:   {:.6}", near_bal);
         }
-        Err(_) => {
-            println!("║   NEAR:   ⚠️  account not found");
-        }
+        Err(_) => println!("║   NEAR:   ⚠️  account not found"),
     }
 
-    // FT balances
-    for (contract_id, symbol, decimals) in KNOWN_TOKENS {
+    // Check well-known tokens (any NEP-141 token works, these are just common ones)
+    let common_tokens = [
+        ("usdt.fakes.testnet", "USDT"),
+        ("usdc.fakes.testnet", "USDC"),
+        ("wrap.testnet", "wNEAR"),
+        ("token.v2.ref-finance.testnet", "REF"),
+    ];
+
+    for (contract_id, _symbol) in &common_tokens {
         let contract: AccountId = contract_id.parse()?;
-        let ft_balance = query_ft_balance(network, account_id, &contract).await;
-        match ft_balance {
-            Some(raw_amount) => {
-                let divisor = 10u128.pow(*decimals as u32) as f64;
-                let human = raw_amount as f64 / divisor;
-                if raw_amount > 0 {
-                    println!("║   {}: {:.6}", format!("{:5}", symbol), human);
-                } else {
-                    println!("║   {}: 0", format!("{:5}", symbol));
-                }
+        if let Some(balance) = query_ft_balance(network, account_id, &contract).await {
+            if balance > 0 {
+                // Get metadata for proper decimals
+                let meta = get_ft_metadata(network, &contract).await;
+                let (symbol, decimals) = match meta {
+                    Some(m) => (m.symbol, m.decimals),
+                    None => (_symbol.to_string(), 24u8),
+                };
+                let human = balance as f64 / 10u128.pow(decimals as u32) as f64;
+                println!("║   {}: {:.6}", format!("{:8}", symbol), human);
             }
-            None => println!("║   {}: — (not registered or error)", symbol),
         }
     }
 
+    println!("║");
+    println!("║   Check any token: balance <contract_id>");
     println!("╚══════════════════════════════════════════════════╝");
     Ok(())
 }
 
-async fn query_ft_balance(network: &NetworkConfig, account_id: &AccountId, contract_id: &AccountId) -> Option<u128> {
-    let result: near_api::Data<serde_json::Value> = Contract(contract_id.clone())
-        .call_function("ft_balance_of", serde_json::json!({
-            "account_id": account_id.as_str(),
-        }))
-        .read_only()
-        .fetch_from(network)
-        .await
-        .ok()?;
+async fn cmd_balance_single(
+    network: &NetworkConfig,
+    account_id: &AccountId,
+    contract_id: &str,
+) -> anyhow::Result<()> {
+    let contract: AccountId = contract_id.parse()?;
 
-    // Balance comes as a string (U128)
-    result.data.as_str()
-        .and_then(|s| s.parse::<u128>().ok())
+    // Get metadata
+    let meta = get_ft_metadata(network, &contract).await;
+    let (name, symbol, decimals) = match &meta {
+        Some(m) => (m.name.clone(), m.symbol.clone(), m.decimals),
+        None => ("Unknown".into(), "???".into(), 24u8),
+    };
+
+    // Get balance
+    match query_ft_balance(network, account_id, &contract).await {
+        Some(balance) => {
+            let human = balance as f64 / 10u128.pow(decimals as u32) as f64;
+            println!("{} ({})", symbol, name);
+            println!("Contract: {}", contract_id);
+            println!("Decimals: {}", decimals);
+            println!("Raw:      {}", balance);
+            println!("Balance:  {:.6} {}", human, symbol);
+        }
+        None => println!("⚠️  Could not query balance (not registered or not a valid FT contract)"),
+    }
+    Ok(())
 }
 
 // ── Transfer ──────────────────────────────────────────────────────────────────
@@ -167,14 +221,14 @@ async fn cmd_transfer(
     nostr_sk: &SigningKey,
     to: &str,
     amount_str: &str,
-    token: Option<&str>,
+    token_contract: Option<&String>,
 ) -> anyhow::Result<()> {
     let to_id: AccountId = to.parse()?;
     let amount: f64 = amount_str.parse()?;
 
-    match token.map(|t| t.to_uppercase()).as_deref() {
-        None | Some("NEAR") => transfer_near(network, account_id, path, near_public_key, nostr_sk, &to_id, amount).await?,
-        symbol => transfer_ft(network, account_id, path, near_public_key, nostr_sk, &to_id, amount, symbol.unwrap_or("NEAR")).await?,
+    match token_contract {
+        None => transfer_near(network, account_id, path, near_public_key, nostr_sk, &to_id, amount).await?,
+        Some(contract) => transfer_ft(network, account_id, path, near_public_key, nostr_sk, &to_id, amount, contract).await?,
     }
     Ok(())
 }
@@ -217,26 +271,29 @@ async fn transfer_ft(
     nostr_sk: &SigningKey,
     to_id: &AccountId,
     amount: f64,
-    symbol: &str,
+    contract_id: &str,
 ) -> anyhow::Result<()> {
-    // Find token contract
-    let (contract_id, _, decimals) = KNOWN_TOKENS.iter()
-        .find(|(_, sym, _)| sym == &symbol)
-        .ok_or_else(|| anyhow::anyhow!("Unknown token: {}. Available: NEAR, USDT, USDC, wNEAR, REF", symbol))?;
+    let contract: AccountId = contract_id.parse()?;
 
-    let contract_account: AccountId = contract_id.parse()?;
-    let raw_amount = (amount * 10f64.powi(*decimals as i32)) as u128;
+    // Auto-detect decimals from ft_metadata
+    let meta = get_ft_metadata(network, &contract).await;
+    let (symbol, decimals) = match &meta {
+        Some(m) => (m.symbol.clone(), m.decimals),
+        None => {
+            println!("⚠️  Could not fetch ft_metadata, assuming 24 decimals");
+            ("???".into(), 24u8)
+        }
+    };
 
+    let raw_amount = (amount * 10f64.powi(decimals as i32)) as u128;
     println!("Transfer {} {} → {} via MPC", amount, symbol, to_id);
-    println!("Contract: {}, Raw amount: {}\n", contract_id, raw_amount);
+    println!("Contract: {}, Decimals: {}, Raw: {}\n", contract_id, decimals, raw_amount);
 
     let pk: PublicKey = near_public_key.parse()?;
     let (nonce, block_hash) = get_nonce_blockhash(network, account_id, &pk).await?;
     println!("① Nonce: {}", nonce);
 
-    // FT transfer: call ft_transfer on the token contract
-    // ft_transfer(receiver_id, amount, memo)
-    let ft_transfer_args = serde_json::json!({
+    let ft_args = serde_json::json!({
         "receiver_id": to_id.as_str(),
         "amount": raw_amount.to_string(),
     });
@@ -245,14 +302,13 @@ async fn transfer_ft(
         signer_id: account_id.clone(),
         public_key: pk,
         nonce: nonce + 1,
-        receiver_id: contract_account,
+        receiver_id: contract,
         block_hash,
         actions: vec![
-            // FT transfer requires deposit of 1 yoctoNEAR
             Action::Transfer(TransferAction { deposit: NearToken::from_yoctonear(1) }),
             Action::FunctionCall(Box::new(FunctionCallAction {
                 method_name: "ft_transfer".to_string(),
-                args: serde_json::to_vec(&ft_transfer_args)?,
+                args: serde_json::to_vec(&ft_args)?,
                 gas: NearGas::from_tgas(50),
                 deposit: NearToken::from_yoctonear(1),
             })),
@@ -260,6 +316,46 @@ async fn transfer_ft(
     });
 
     sign_and_send(network, path, nostr_sk, account_id, &unsigned_tx).await
+}
+
+// ── Create Account ────────────────────────────────────────────────────────────
+
+async fn cmd_create(
+    network: &NetworkConfig,
+    account_id: &AccountId,
+    path: &str,
+    near_public_key: &str,
+) -> anyhow::Result<()> {
+    let private_key = std::env::var("PRIVATE_KEY").expect("Set PRIVATE_KEY (sponsor key)");
+    let funder = std::env::var("ACCOUNT_ID").unwrap_or_else(|_| "kampouse.testnet".to_string());
+    let funder_id: AccountId = funder.parse()?;
+
+    println!("Creating {} with MPC-derived key\n", account_id);
+
+    let signer = Signer::from_secret_key(private_key.parse()?)?;
+
+    let create_result = Account::create_account(account_id.clone())
+        .fund_myself(funder_id.clone(), NearToken::from_near(0))
+        .with_public_key(near_api::types::PublicKey::from_str(near_public_key)?)
+        .with_signer(signer)
+        .send_to(network)
+        .await;
+
+    match create_result {
+        Ok(tx) => {
+            tx.assert_success();
+            println!("✅ Created: {}", account_id);
+        }
+        Err(e) => {
+            let err = format!("{:?}", e);
+            if err.contains("AlreadyExists") {
+                println!("Already exists");
+            } else {
+                println!("⚠️  {}", &err[..err.len().min(300)]);
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
@@ -283,17 +379,14 @@ async fn sign_and_send(
     account_id: &AccountId,
     unsigned_tx: &Transaction,
 ) -> anyhow::Result<()> {
-    // Hash the unsigned tx
     let tx_bytes = borsh::to_vec(unsigned_tx)?;
     let tx_hash: [u8; 32] = Sha256::digest(&tx_bytes).into();
     println!("② TX hash: {}", hex::encode(tx_hash));
 
-    // Nostr auth proof
     let auth_msg = format!("authorize from {} | hash:{}", account_id, hex::encode(tx_hash));
     let auth_sig = nostr_sk.sign(auth_msg.as_bytes());
     println!("③ Nostr auth: {}...✅", &hex::encode(auth_sig.to_bytes())[..16]);
 
-    // Call MPC.sign via sponsor
     let sponsor_key = std::env::var("SPONSOR_KEY").expect("Set SPONSOR_KEY");
     let sponsor_account: AccountId = std::env::var("SPONSOR_ACCOUNT")
         .unwrap_or_else(|_| "kampouse.testnet".to_string()).parse()?;
@@ -319,7 +412,7 @@ async fn sign_and_send(
 
     match sign_result {
         Ok(_) => {
-            println!("   ✅ MPC signing request submitted");
+            println!("   ✅ MPC signing submitted");
             println!("\n   Track: https://explorer.testnet.near.org/accounts/{}", account_id);
         }
         Err(e) => {
@@ -327,7 +420,6 @@ async fn sign_and_send(
             println!("   ⚠️  MPC.sign() failed: {}", &err[..err.len().min(300)]);
         }
     }
-
     Ok(())
 }
 
