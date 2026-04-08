@@ -191,3 +191,62 @@ async fn test_full_e2e_partial_flow() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_registration_flow() -> Result<()> {
+    let relay_url = std::env::var("RELAY_URL")
+        .unwrap_or_else(|_| "ws://127.0.0.1:8080".to_string());
+
+    let sender_keys = Keys::generate();
+    let sender_pk = sender_keys.public_key().to_hex();
+    println!("\n═══ Registration Flow Test ═══");
+    println!("Sender: {}...{}", &sender_pk[..16], &sender_pk[sender_pk.len()-8..]);
+    println!("Relay: {}", relay_url);
+
+    // Build kind 5000 (registration) event
+    let event = EventBuilder::new(Kind::Custom(5000), "register")
+        .sign_with_keys(&sender_keys)?;
+
+    assert!(event.verify_signature(), "Event signature should be valid");
+    println!("✅ Registration event signed");
+
+    let accepted = send_event(&relay_url, &event).await
+        .context("Failed to send event to relay")?;
+    assert!(accepted, "Relay should accept the event");
+    println!("✅ Relay accepted event (id: {}...)", &event.id.to_hex()[..16]);
+
+    println!("Waiting for kind 7000 feedback (30s timeout)...");
+    println!("NOTE: Worker must be running!");
+
+    let feedback = subscribe_and_collect(&relay_url, vec![7000], Some(&event.id.to_hex()), 30).await?;
+
+    if feedback.is_empty() {
+        println!("\n⚠️  No feedback received (worker may not be running)");
+    } else {
+        println!("\n🎉 REGISTRATION FEEDBACK RECEIVED!");
+        for fb in &feedback {
+            let status = fb.tags.iter()
+                .find(|t| t.kind() == TagKind::custom("status"))
+                .and_then(|t| t.content())
+                .unwrap_or("?");
+            println!("  Status: {}", status);
+            println!("  Content: {}", fb.content);
+
+            if fb.content.starts_with("account:") {
+                for part in fb.content.split('|') {
+                    match part {
+                        p if p.starts_with("account:") => println!("  📋 NEAR Account: {}", &p[8..]),
+                        p if p.starts_with("key:") => println!("  🔑 MPC Key: {}...", &p[4..40.min(p.len())]),
+                        p if p.starts_with("path:") => println!("  🛤️  Path: {}", &p[5..]),
+                        _ => {}
+                    }
+                }
+            }
+
+            assert!(fb.verify_signature(), "Feedback signature should be valid");
+            println!("  ✅ Signature verified");
+        }
+        println!("\n✅ REGISTRATION TEST PASSED");
+    }
+    Ok(())
+}

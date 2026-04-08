@@ -116,7 +116,7 @@ impl Worker {
         println!("║   PID:     {}", std::process::id());
         println!("║   PIDfile: {}", pidfile);
         println!("║                                                  ║");
-        println!("║   Listening for kind 5001 (job request) events   ║");
+        println!("║   Listening for kind 5000 (register) & 5001 (transfer) events  ║");
         println!("╚══════════════════════════════════════════════════╝\n");
 
         loop {
@@ -135,9 +135,9 @@ impl Worker {
         println!("✅ Connected to relay");
 
         let sub_id = format!("mpc-{}", &self.keys.public_key().to_hex()[..8]);
-        let req = serde_json::json!(["REQ", sub_id, {"kinds": [5001], "limit": 100}]).to_string();
+        let req = serde_json::json!(["REQ", sub_id, {"kinds": [5000, 5001], "limit": 100}]).to_string();
         ws.send(Message::Text(req.into())).await?;
-        println!("📡 Subscribed to kind 5001 events\n");
+        println!("📡 Subscribed to kind 5000 (register) & 5001 (transfer) events\n");
 
         while let Some(msg) = ws.next().await {
             match msg {
@@ -173,10 +173,101 @@ impl Worker {
         let event: nostr::Event = nostr::Event::from_json(event_json.to_string())
             .context("Failed to parse Nostr event")?;
 
-        if event.kind.as_u16() != 5001 { return Ok(()); }
-
+        let kind = event.kind.as_u16();
         let pk_hex = event.pubkey.to_hex();
-        println!("📨 Job from {}...{}", &pk_hex[..16], &pk_hex[pk_hex.len()-8..]);
+
+        match kind {
+            5000 => self.handle_registration(&event, &pk_hex).await,
+            5001 => self.handle_transfer(&event, &pk_hex, event_json).await,
+            _ => Ok(()),
+        }
+    }
+
+    // ── Registration (kind 5000) ────────────────────────────────────────────
+
+    async fn handle_registration(&self, event: &nostr::Event, pk_hex: &str) -> Result<()> {
+        println!("📨 Register from {}...{}", &pk_hex[..16], &pk_hex[pk_hex.len()-8..]);
+
+        // 1. Verify signature
+        if !event.verify_signature() {
+            tracing::warn!("Invalid signature from {}", &pk_hex[..16]);
+            self.publish_feedback(event, "error", "Invalid signature").await?;
+            return Ok(());
+        }
+        println!("   ✅ Signature valid");
+
+        // 2. Derive the MPC key for this Nostr identity
+        let path = format!("nostr:{}", pk_hex);
+        let near_public_key = mpc::derive_public_key(&path, self.sponsor_account.as_str(), &self.network).await?;
+        println!("   🔑 MPC key: {}...", &near_public_key[..40.min(near_public_key.len())]);
+
+        // 3. Create a NEAR account for this user
+        // Account name: nostr-<first 12 hex chars of npub>.testnet
+        let account_name = format!("n{}-{}.testnet", &pk_hex[..4], &pk_hex[4..12]);
+        let account_id: near_api::AccountId = account_name.parse()
+            .context("Invalid derived account name")?;
+
+        match self.create_account(&account_id, &near_public_key).await {
+            Ok(_) => {
+                let msg = format!(
+                    "account:{}|key:{}|path:{}",
+                    account_id, near_public_key, path
+                );
+                self.publish_feedback(event, "success", &msg).await?;
+                println!("   ✅ Registered: {}", account_id);
+            }
+            Err(e) => {
+                let err_str = format!("{}", e);
+                if err_str.contains("AlreadyExists") || err_str.contains("already") {
+                    // Account exists, just return the info
+                    let msg = format!(
+                        "account:{}|key:{}|path:{}|status:exists",
+                        account_id, near_public_key, path
+                    );
+                    self.publish_feedback(event, "success", &msg).await?;
+                    println!("   ℹ️  Already registered: {}", account_id);
+                } else {
+                    let msg = format!("Registration failed: {}", e);
+                    tracing::error!("{}", msg);
+                    self.publish_feedback(event, "error", &msg).await?;
+                }
+            }
+        }
+
+        println!();
+        Ok(())
+    }
+
+    async fn create_account(
+        &self,
+        account_id: &near_api::AccountId,
+        public_key: &str,
+    ) -> Result<()> {
+        use near_api::{Account, NearToken, Signer};
+        use near_api::types::PublicKey;
+        use std::str::FromStr;
+
+        let signer = Signer::from_secret_key(self.sponsor_key.parse()?)?;
+        let pk = PublicKey::from_str(public_key)?;
+
+        println!("   Creating {} with MPC-derived key...", account_id);
+
+        let result = Account::create_account(account_id.clone())
+            .fund_myself(self.sponsor_account.clone(), NearToken::from_near(0))
+            .with_public_key(pk)
+            .with_signer(signer)
+            .send_to(&self.network)
+            .await
+            .map_err(|e| anyhow::anyhow!("Create account failed: {:?}", e))?;
+
+        result.assert_success();
+        Ok(())
+    }
+
+    // ── Transfer (kind 5001) ────────────────────────────────────────────────
+
+    async fn handle_transfer(&self, event: &nostr::Event, pk_hex: &str, event_json: &serde_json::Value) -> Result<()> {
+        println!("📨 Transfer from {}...{}", &pk_hex[..16], &pk_hex[pk_hex.len()-8..]);
         println!("   Content: {}", &event.content[..100.min(event.content.len())]);
 
         // 1. Verify signature (secp256k1 schnorr)
