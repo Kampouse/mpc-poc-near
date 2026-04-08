@@ -19,3 +19,4 @@ anyhow = "1"
 getrandom = "0.2"
 borsh = "1"
 sha2 = "0.10"
+clap = { version = "4", features = ["derive"] }
