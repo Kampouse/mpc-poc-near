@@ -163,7 +163,7 @@ pub async fn assemble_and_broadcast(
     Ok(final_hash)
 }
 
-/// Full pipeline: MPC sign → assemble → broadcast
+/// Full pipeline: MPC sign → assemble → broadcast (waits for finality)
 pub async fn sign_and_broadcast(
     unsigned_tx: &Transaction,
     payload: &[u8; 32],
@@ -178,4 +178,103 @@ pub async fn sign_and_broadcast(
         anyhow::bail!("Expected 64-byte ed25519 signature, got {} bytes", sign_result.signature.len());
     }
     assemble_and_broadcast(unsigned_tx, &sign_result.signature, network).await
+}
+
+/// #14: Async broadcast — submits tx and returns immediately, then polls for finality
+pub async fn sign_and_broadcast_async(
+    unsigned_tx: &Transaction,
+    payload: &[u8; 32],
+    path: &str,
+    predecessor: &str,
+    sponsor_id: &AccountId,
+    sponsor_key: &str,
+    network: &near_api::NetworkConfig,
+) -> Result<String> {
+    let sign_result = sign_payload(payload, path, predecessor, sponsor_id, sponsor_key, network).await?;
+    if sign_result.signature.len() != 64 {
+        anyhow::bail!("Expected 64-byte ed25519 signature, got {} bytes", sign_result.signature.len());
+    }
+
+    let sig = Signature::from_parts(
+        near_api::types::crypto::KeyType::ED25519,
+        &sign_result.signature,
+    ).context("Invalid ed25519 signature bytes")?;
+
+    let signed_tx = SignedTransaction::new(sig, unsigned_tx.clone());
+    let tx_hash = signed_tx.get_hash();
+    let tx_hash_hex = tx_hash.to_string();
+    tracing::info!("Signed TX hash: {}", tx_hash_hex);
+
+    let tx_borsh = borsh::to_vec(&signed_tx)?;
+    let tx_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &tx_borsh);
+
+    let rpc_url = network.rpc_endpoints.first()
+        .map(|e| e.url.to_string())
+        .unwrap_or_else(|| "https://rpc.testnet.near.org".to_string());
+
+    // Submit async (broadcast_tx_async — returns immediately)
+    let client = reqwest::Client::new();
+    let async_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "0",
+        "method": "broadcast_tx_async",
+        "params": [tx_b64]
+    });
+
+    tracing::info!("Submitting tx async to {}", rpc_url);
+    let resp: serde_json::Value = client
+        .post(&rpc_url)
+        .json(&async_body)
+        .send()
+        .await
+        .context("RPC submit failed")?
+        .json()
+        .await
+        .context("RPC response parse failed")?;
+
+    if let Some(error) = resp.get("error") {
+        anyhow::bail!("RPC error: {:?}", error);
+    }
+
+    // Poll for finality (up to 60s)
+    tracing::info!("Polling for finality: {}", tx_hash_hex);
+    for attempt in 0..30 {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        let check_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "0",
+            "method": "tx",
+            "params": [tx_hash_hex, "unused"]
+        });
+
+        let check_resp: serde_json::Value = match client
+            .post(&rpc_url)
+            .json(&check_body)
+            .send()
+            .await
+        {
+            Ok(r) => r.json().await.unwrap_or(serde_json::json!({})),
+            Err(_) => serde_json::json!({}),
+        };
+
+        if let Some(result) = check_resp.get("result") {
+            let status = result.get("status").or_else(|| result.get("final_execution_status"));
+            if let Some(s) = status {
+                let s_str = serde_json::to_string(s).unwrap_or_default();
+                if s_str.contains("Final") || s_str.contains("SuccessValue") {
+                    tracing::info!("TX finalized: {} (after {}s) — https://explorer.testnet.near.org/transactions/{}",
+                        tx_hash_hex, (attempt + 1) * 2, tx_hash_hex);
+                    return Ok(tx_hash_hex);
+                }
+                if s_str.contains("Failure") || s_str.contains("Error") {
+                    anyhow::bail!("TX failed: {:?}", s);
+                }
+            }
+        }
+    }
+
+    // Timeout — return hash anyway so user can check manually
+    tracing::warn!("TX finality timeout (60s), hash: {}", tx_hash_hex);
+    Ok(format!("{} (pending)", tx_hash_hex))
 }
