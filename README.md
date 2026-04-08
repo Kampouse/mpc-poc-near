@@ -1,173 +1,187 @@
 # mpc-poc-near
 
-Proof of concept: **Nostr key controls a NEAR account via MPC chain-signatures.**
+Nostr → NEAR via Chain Signatures. Send NEAR transactions using only a Nostr identity — no NEAR private key required.
 
-No wallet. No seed phrase. No worker. Just a Nostr keypair.
-
-## How It Works
+## How it works
 
 ```
-Nostr npub (ed25519) → MPC derivation path → deterministic NEAR public key
-                                              → NEAR account (non-custodial)
+Nostr identity (secp256k1) ──→ MPC derivation path ──→ NEAR account (ed25519)
+         │                                              │
+    signs Nostr event                           signs NEAR tx via MPC
+         │                                              │
+         └───── Worker (relay) ───── Lightning payment ─┘
 ```
 
-1. User has a Nostr keypair (any Nostr client generates this for free)
-2. The npub becomes an MPC derivation path: `nostr:<npub>`
-3. NEAR's MPC contract (`v1.signer-prod.testnet`) derives a deterministic ed25519 public key
-4. That key becomes the full access key for a NEAR account
-5. **Nobody has the private key** — only the MPC network can sign
-6. User authorizes transactions by signing Nostr events with their Nostr key
-7. Any sponsor (worker, CLI, contract) calls `MPC.sign(path, payload)` to get the signature
+1. **Register** — Send a Nostr event (kind 5000) to register your Nostr identity as a NEAR account
+2. **Pay** — Worker responds with a Lightning invoice (BTC)
+3. **Transfer** — Pay the invoice, re-submit (kind 5001), worker signs via MPC and broadcasts
+
+The MPC network (8 nodes, threshold signature) derives a unique ed25519 key from `nostr:<npub>`. No single node has the full key. No NEAR private key ever exists anywhere.
 
 ## Architecture
 
+| Component | Role |
+|-----------|------|
+| **Nostr** | Identity layer — secp256k1 schnorr signatures prove who you are |
+| **MPC** (v1.signer-prod.testnet) | Signing layer — threshold signature over NEAR tx |
+| **Worker** | Relay — subscribes to Nostr, orchestrates MPC + payments + broadcast |
+| **Lightning** | Payment layer — BTC Lightning covers NEAR gas costs |
+
+## Flow
+
+### Registration (kind 5000)
 ```
-┌─────────────┐     ┌──────────────┐     ┌──────────────────┐
-│  Nostr Key   │────→│  MPC Contract │────→│  NEAR Account     │
-│  (ed25519)   │     │  (on-chain)   │     │  (non-custodial)  │
-└─────────────┘     └──────────────┘     └──────────────────┘
-       │                                          │
-       │ signs Nostr event (kind 5001)             │
-       ↓                                          ↓
-┌─────────────┐     ┌──────────────┐     ┌──────────────────┐
-│  Nostr Relay │←───→│    Worker     │←───→│  NEAR Blockchain  │
-│  (NIP-90)    │     │  (inlayer)    │     │                   │
-└─────────────┘     └──────────────┘     └──────────────────┘
-       │                    │
-       │    OR (recovery)   │
-       ↓                    ↓
-┌─────────────────────────────────┐
-│  This CLI (no worker needed)    │
-│  NOSTR_SK + any sponsor key     │
-└─────────────────────────────────┘
+User ──[kind 5000, account:my-name.testnet]──→ Relay → Worker
+Worker: verify sig → derive MPC key → create NEAR account → feedback
 ```
 
-## Quick Start
+### Transfer (kind 5001)
+```
+User ──[kind 5001, {to, amount}]──→ Relay → Worker
+Worker: verify sig → create Lightning invoice → [payment_required]
+User ──[kind 5001, {to, amount}, payment_hash]──→ Relay → Worker  
+Worker: verify payment → MPC sign → broadcast → [success, tx: ...]
+```
+
+## Setup
+
+### Prerequisites
+- Rust 1.75+
+- NEAR testnet account with funds (sponsor)
+- A Nostr relay (local or public)
+
+### Build
+```bash
+git clone https://github.com/Kampouse/mpc-poc-near.git
+cd mpc-poc-near
+cargo build --release
+```
+
+### Run Worker
 
 ```bash
-# Build
-cargo build
+# Required
+export RELAY_URL=wss://relay.damus.io          # or your own relay
+export WORKER_NSEC=<hex>                        # worker's Nostr secret key
+export SPONSOR_KEY=ed25519:xxx                  # NEAR sponsor private key
+export SPONSOR_ACCOUNT=kampouse.testnet         # NEAR sponsor account
 
-# Create a NEAR account from a Nostr key
-NOSTR_SK=<hex> \
-NEAR_ACCOUNT=my-agent.testnet \
-PRIVATE_KEY=ed25519:<sponsor_key> \
-ACCOUNT_ID=kampouse.testnet \
-cargo run -- create
+# Payment (pick one)
+export NWC_URL=nostr+walletconnect://...        # Real Lightning via NIP-47
+# export NO_PAYMENT=1                           # Skip payments (dev mode)
+# (default: mock — auto-approves all payments)
 
-# Check balances (NEAR + all FTs)
-NOSTR_SK=<hex> NEAR_ACCOUNT=my-agent.testnet cargo run -- balances
+# Start
+cargo run --bin mpc-worker
 
-# Transfer NEAR
-NOSTR_SK=<hex> NEAR_ACCOUNT=my-agent.testnet \
-SPONSOR_KEY=ed25519:xxx SPONSOR_ACCOUNT=kampouse.testnet \
-cargo run -- transfer bob.testnet 0.5
-
-# Transfer USDT
-NOSTR_SK=<hex> NEAR_ACCOUNT=my-agent.testnet \
-SPONSOR_KEY=ed25519:xxx SPONSOR_ACCOUNT=kampouse.testnet \
-cargo run -- transfer bob.testnet 100 USDT
-
-# Account info
-NOSTR_SK=<hex> NEAR_ACCOUNT=my-agent.testnet cargo run -- info
+# Or as daemon
+cargo run --bin mpc-worker -- --daemon
+cargo run --bin mpc-worker -- --status
+cargo run --bin mpc-worker -- --stop
 ```
 
-## Commands
+### Run Tests
 
-| Command | Description |
-|---------|-------------|
-| `create` | Create a NEAR account with MPC-derived key |
-| `info` | Show account info and MPC derivation |
-| `balances` | Show NEAR + all FT balances |
-| `transfer <to> <amount> [token]` | Send NEAR or FT via MPC signing |
-| `sign-test` | Verify Nostr key works |
+```bash
+# Start a local relay (uses nostr-rs-relay)
+# Then:
+RELAY_URL=ws://127.0.0.1:8090 cargo test --test e2e -- --nocapture
+RELAY_URL=ws://127.0.0.1:8090 cargo test --test funded_transfer -- --nocapture
+```
 
-## Environment Variables
+## Event Types
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `NOSTR_SK` | Yes | Hex ed25519 secret key (from Nostr client) |
-| `NEAR_ACCOUNT` | Yes | NEAR account name |
-| `PRIVATE_KEY` | create only | Sponsor's ed25519 key (pays for account creation) |
-| `ACCOUNT_ID` | create only | Sponsor's NEAR account |
-| `SPONSOR_KEY` | transfer | Sponsor's ed25519 key (pays MPC gas) |
-| `SPONSOR_ACCOUNT` | transfer | Sponsor's NEAR account (default: kampouse.testnet) |
+| Kind | Direction | Purpose |
+|------|-----------|---------|
+| 5000 | User → Worker | Register a NEAR account |
+| 5001 | User → Worker | Transfer request |
+| 7000 | Worker → User | Feedback (status, invoice, tx hash) |
 
-## Supported Tokens
+### Kind 5000 — Registration
+```json
+{
+  "kind": 5000,
+  "content": "account:my-name.testnet",
+  "tags": []
+}
+```
+Or use a tag: `["n", "my-name.testnet"]`
 
-| Symbol | Contract (Testnet) |
-|--------|-------------------|
-| NEAR | native |
-| USDT | `usdt.fakes.testnet` |
-| USDC | `usdc.fakes.testnet` |
-| wNEAR | `wrap.testnet` |
-| REF | `token.v2.ref-finance.testnet` |
+If no name specified, derives: `n<4hex>-<8hex>.testnet`
 
-For mainnet, update the `KNOWN_TOKENS` array in `src/main.rs`.
-
-## Integration with Inlayer (Worker)
-
-The worker (inlayer) does the same thing as this CLI, but automated:
-
-1. **Subscribe to Nostr relay** — watch for kind 5001 (job request) events
-2. **Verify Nostr signature** — standard ed25519 verification
-3. **Lookup MPC path** — `nostr:<event.pubkey>` → bound NEAR account
-4. **Build NEAR transaction** — based on event content
-5. **Call MPC.sign()** — sponsor account calls the MPC contract
-6. **Broadcast signed tx** — submit to NEAR
-7. **Publish result** — kind 6001 event back to Nostr relay
-
-```rust
-// Pseudocode for worker integration
-async fn handle_job(event: NostrEvent) {
-    verify_nostr_sig(&event)?;
-
-    let path = format!("nostr:{}", event.pubkey);
-    let near_account = lookup_binding(&event.pubkey)?;
-
-    // Check Lightning payment (NIP-90 / L402)
-    verify_payment(&event).await?;
-
-    // Build & sign tx via MPC
-    let unsigned_tx = build_transfer_tx(near_account, event.parse_params());
-    let tx_hash = sha256(borsh::serialize(&unsigned_tx));
-
-    let signature = mpc_contract.sign(path, tx_hash).await?;
-
-    broadcast_tx(unsigned_tx, signature).await?;
-    publish_result(event.pubkey, "success", tx_hash).await?;
+### Kind 5001 — Transfer
+```json
+{
+  "kind": 5001,
+  "content": "{\"to\":\"bob.testnet\",\"amount\":\"0.001\"}",
+  "tags": [["i", "{\"to\":\"bob.testnet\",\"amount\":\"0.001\"}"]]
 }
 ```
 
-## Security Model
-
-| Property | How |
-|----------|-----|
-| Non-custodial | MPC holds the private key — nobody else has it |
-| Auth | Nostr ed25519 signature = proof of key ownership |
-| Recovery | This CLI + Nostr key = full access, no worker needed |
-| No vendor lock-in | Any sponsor can call MPC — not tied to one worker |
-| On-chain | All signing goes through the MPC contract on NEAR |
-
-## Key Files
-
-```
-src/main.rs    — Full CLI: create account, check balances, transfer NEAR/FTs
-Cargo.toml     — near-api-rs, ed25519-dalek, borsh, sha2
+With payment proof (after receiving invoice):
+```json
+{
+  "kind": 5001,
+  "content": "{\"to\":\"bob.testnet\",\"amount\":\"0.001\"}",
+  "tags": [
+    ["i", "{\"to\":\"bob.testnet\",\"amount\":\"0.001\"}"],
+    ["payment_hash", "abc123..."]
+  ]
+}
 ```
 
-## Stack
+For FT transfers, add `"token": "contract.near"`.
 
-- **Nostr** — identity & communication (ed25519 keys)
-- **NEAR MPC** — chain-signatures for non-custodial key derivation
-- **near-api-rs** — Rust SDK for all NEAR interactions
-- **ed25519-dalek** — Nostr key handling
+### Kind 7000 — Feedback
+```json
+{
+  "kind": 7000,
+  "tags": [
+    ["e", "<original_event_id>"],
+    ["p", "<user_pubkey>"],
+    ["status", "success"]
+  ],
+  "content": "Sent 0.001 NEAR to bob.testnet | tx: DP5DN7vkmUgG..."
+}
+```
 
-## Related Projects
+Status values: `success`, `error`, `payment_required`
 
-- [nostr-identity](https://github.com/Kampouse/nostr-identity) — TEE + ZKP identity binding
-- [nostr-rs-relay](https://github.com/Kampouse/nostr-rs-relay) — Nostr relay in Rust
-- [NEAR Chain Signatures](https://docs.near.org/chain-abstraction/chain-signatures) — MPC docs
+## Payments
+
+| Mode | Config | Use case |
+|------|--------|----------|
+| NIP-47 (NWC) | `NWC_URL=...` | Production — real Lightning |
+| Mock | (default) | Testing — auto-approves |
+| Free | `NO_PAYMENT=1` | Dev — sponsor covers all |
+
+### Pricing (default, in sats)
+- Registration: 1,000 sats
+- NEAR transfer: 500 + 100/NEAR
+- FT transfer: 500 sats
+
+## Security
+
+**Threat model:**
+- Nostr key = full control over associated NEAR account. Protect it.
+- Worker is trusted — it sees all requests and could censor.
+- MPC threshold (8 nodes) — compromising ≥threshold nodes exposes all derived keys.
+- Dedup prevents replay attacks.
+- Input validated: amounts must be positive, recipients must be valid account IDs.
+
+**Not yet implemented:**
+- Rate limiting
+- Account ownership verification (anyone could pre-create `nXXX-YYY.testnet` with their own key)
+- Multi-relay failover
+- Event pruning (processed set grows unbounded)
+
+## Verified On-Chain
+
+TX [`6fbuwBRrtKmW5KXAaCkkkKNCB6TwgjCxMZmgKxfzyU81`](https://explorer.testnet.near.org/transactions/6fbuwBRrtKmW5KXAaCkkkKNCB6TwgjCxMZmgKxfzyU81):
+- `ncb41-ed482d9b.testnet` → `kampouse.testnet`
+- 0.001 NEAR
+- Signed by MPC-derived key from Nostr identity
+- No NEAR private key existed anywhere
 
 ## License
 
