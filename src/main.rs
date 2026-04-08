@@ -327,7 +327,7 @@ async fn cmd_create(
     near_public_key: &str,
 ) -> anyhow::Result<()> {
     let private_key = std::env::var("PRIVATE_KEY").expect("Set PRIVATE_KEY (sponsor key)");
-    let funder = std::env::var("ACCOUNT_ID").unwrap_or_else(|_| "kampouse.testnet".to_string());
+    let funder = std::env::var("ACCOUNT_ID").expect("Set ACCOUNT_ID (funder account)");
     let funder_id: AccountId = funder.parse()?;
 
     println!("Creating {} with MPC-derived key\n", account_id);
@@ -389,7 +389,7 @@ async fn sign_and_send(
 
     let sponsor_key = std::env::var("SPONSOR_KEY").expect("Set SPONSOR_KEY");
     let sponsor_account: AccountId = std::env::var("SPONSOR_ACCOUNT")
-        .unwrap_or_else(|_| "kampouse.testnet".to_string()).parse()?;
+        .expect("Set SPONSOR_ACCOUNT").parse()?;
     let sponsor_signer = Signer::from_secret_key(sponsor_key.parse()?)?;
 
     println!("④ Calling MPC.sign() as {}...", sponsor_account);
