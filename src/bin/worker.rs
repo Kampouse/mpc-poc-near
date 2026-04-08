@@ -330,8 +330,10 @@ impl Worker {
         // Resolve the sender's NEAR account from the nostr pubkey binding
         // For now, we use the pubkey hex as account lookup
         // TODO: maintain a nostr_pubkey → NEAR account mapping
-        let sender_account: near_api::AccountId = format!("nostr-{}", &sender_pk_hex[..12])
-            .parse().context("Invalid derived account")?;
+        // Derive account name from pubkey (must match registration naming)
+        let account_name = format!("n{}-{}.testnet", &sender_pk_hex[..4], &sender_pk_hex[4..12]);
+        let sender_account: near_api::AccountId = account_name.parse()
+            .context("Invalid derived account")?;
 
         let to_id: near_api::AccountId = params.to.parse()
             .context("Invalid recipient in job")?;

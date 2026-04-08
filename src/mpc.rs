@@ -45,14 +45,11 @@ pub async fn derive_key_for_config(cfg: &Config) -> Result<String> {
 }
 
 /// MPC signature response (from the sign call via yield-resume)
+/// The MPC contract returns: {"scheme": "Ed25519", "signature": [u8; 64]}
 #[derive(Debug, Deserialize)]
 pub struct SignResult {
-    #[serde(default)]
-    pub big_r: Option<String>,
-    #[serde(default)]
-    pub s: Option<String>,
-    #[serde(default)]
-    pub recovery_id: Option<u32>,
+    pub scheme: String,
+    pub signature: Vec<u8>,
 }
 
 /// Request MPC to sign a 32-byte payload and return the signature.
@@ -72,7 +69,7 @@ pub async fn sign_payload(
     let result = Contract(mpc_account()?)
         .call_function("sign", serde_json::json!({
             "request": {
-                "payload_v2": { "Eddsa": payload_vec },
+                "payload_v2": { "Eddsa": hex::encode(payload) },
                 "path": path,
                 "domain_id": 1,
             }
@@ -88,28 +85,27 @@ pub async fn sign_payload(
     let exec_result = result.into_result()
         .map_err(|e| anyhow::anyhow!("MPC execution failed: {:?}", e))?;
 
-    // Try to parse the return value
+    // Debug: log what we got back
+    if let Ok(bytes) = exec_result.raw_bytes() {
+        println!("   MPC raw bytes ({}): {:?}...", bytes.len(), &bytes[..bytes.len().min(32)]);
+    }
+    if let Ok(val) = exec_result.json::<serde_json::Value>() {
+        println!("   MPC JSON: {:?}", val);
+    }
+
+    // The MPC contract returns JSON: {"scheme":"Ed25519","signature":[u8;64]}
     match exec_result.json::<SignResult>() {
         Ok(sig) => {
-            println!("   ✅ MPC signature received");
+            println!("   ✅ MPC signature received ({} bytes, scheme={})", sig.signature.len(), sig.scheme);
             Ok(sig)
         }
-        Err(_) => {
+        Err(e) => {
             let bytes = exec_result.raw_bytes()
                 .context("No return data from MPC sign")?;
-            if bytes.len() == 64 {
-                let sig_hex = hex::encode(&bytes);
-                println!("   ✅ MPC signature received (raw 64 bytes)");
-                Ok(SignResult {
-                    big_r: None,
-                    s: Some(sig_hex),
-                    recovery_id: None,
-                })
-            } else {
-                let json_str = String::from_utf8_lossy(&bytes);
-                serde_json::from_str(&json_str)
-                    .context(format!("Cannot parse MPC sign result: {}", json_str))
-            }
+            let sig: SignResult = serde_json::from_slice(&bytes)
+                .context(format!("Cannot parse MPC sign result (json err: {:?})", e))?;
+            println!("   ✅ MPC signature received (fallback parse, {} bytes)", sig.signature.len());
+            Ok(sig)
         }
     }
 }
@@ -208,12 +204,9 @@ pub async fn sign_and_broadcast(
 ) -> Result<String> {
     let sign_result = sign_payload(payload, path, predecessor, sponsor_id, sponsor_key, network).await?;
 
-    let sig_hex = sign_result.s.context("MPC returned no signature")?;
-    let sig_bytes = hex::decode(&sig_hex).context("Invalid signature hex")?;
-
-    if sig_bytes.len() != 64 {
-        anyhow::bail!("Expected 64-byte ed25519 signature, got {} bytes", sig_bytes.len());
+    if sign_result.signature.len() != 64 {
+        anyhow::bail!("Expected 64-byte ed25519 signature, got {} bytes", sign_result.signature.len());
     }
 
-    assemble_and_broadcast(unsigned_tx, &sig_bytes, network).await
+    assemble_and_broadcast(unsigned_tx, &sign_result.signature, network).await
 }
