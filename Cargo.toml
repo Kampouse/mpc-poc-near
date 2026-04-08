@@ -32,6 +32,7 @@ getrandom = "0.2"
 borsh = "1"
 sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
+nostr = "0.44"
 nostr-sdk = "0.44"
 tokio-tungstenite = "0.26"
 futures-util = "0.3"

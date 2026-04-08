@@ -1613,6 +1613,7 @@ dependencies = [
  "hex",
  "libc",
  "near-api",
+ "nostr",
  "nostr-sdk",
  "serde",
  "serde_json",

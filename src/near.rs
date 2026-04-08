@@ -17,7 +17,7 @@ use crate::mpc;
 
 pub async fn create_account(cfg: &Config) -> Result<()> {
     let (funder_id, funder_key) = cfg.require_funder()?;
-    let near_public_key = mpc::derive_public_key(cfg).await?;
+    let near_public_key = derive_key(cfg).await?;
     let signer = Signer::from_secret_key(funder_key.parse()?)?;
 
     println!("Creating {} with MPC-derived key\n", cfg.near_account);
@@ -49,7 +49,7 @@ pub async fn create_account(cfg: &Config) -> Result<()> {
 // ── Info ──────────────────────────────────────────────────────────────────────
 
 pub async fn show_info(cfg: &Config) -> Result<()> {
-    let near_public_key = mpc::derive_public_key(cfg).await?;
+    let near_public_key = derive_key(cfg).await?;
     let chain = match Account(cfg.near_account.clone()).view().fetch_from(&cfg.network).await {
         Ok(s) => format!("✅ ({} NEAR)", s.data.amount.as_yoctonear() as f64 / 1e24),
         Err(_) => "❌ not found".into(),
@@ -92,10 +92,15 @@ pub async fn show_balances(cfg: &Config) -> Result<()> {
 
 // ── Transfer ─────────────────────────────────────────────────────────────────
 
+/// Derive key for this config
+pub async fn derive_key(cfg: &Config) -> Result<String> {
+    mpc::derive_public_key(&cfg.mpc_path, cfg.near_account.as_str(), &cfg.network).await
+}
+
 pub async fn transfer(cfg: &Config, to: &str, amount_str: &str, token: Option<&str>) -> Result<()> {
     let to_id: AccountId = to.parse().with_context(|| format!("Invalid recipient: {}", to))?;
     let amount: f64 = amount_str.parse().with_context(|| format!("Invalid amount: {}", amount_str))?;
-    let near_public_key = mpc::derive_public_key(cfg).await?;
+    let near_public_key = derive_key(cfg).await?;
 
     match token {
         None => build_and_sign_near(cfg, &near_public_key, &to_id, amount).await,
@@ -201,5 +206,11 @@ async fn sign_and_send(cfg: &Config, unsigned_tx: &Transaction) -> Result<()> {
     let auth_sig = cfg.nostr_sk.sign(auth_msg.as_bytes());
     println!("③ Nostr auth: {}...✅", &hex::encode(auth_sig.to_bytes())[..16]);
 
-    mpc::sign_payload(cfg, &tx_hash).await
+    // Call MPC to sign the tx hash
+    let _sign_result = mpc::sign_payload_with_config(cfg, &tx_hash).await?;
+    println!("④ MPC signed. TODO: assemble signed tx & broadcast");
+    println!("   Track: https://explorer.testnet.near.org/accounts/{}", cfg.near_account);
+    // TODO: convert SignResult (big_r, s, recovery_id) to ed25519 signature
+    //       assemble SignedTransaction, broadcast via RPC
+    Ok(())
 }
