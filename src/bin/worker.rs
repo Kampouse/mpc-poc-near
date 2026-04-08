@@ -17,7 +17,9 @@ use serde::Deserialize;
 use sha2::Digest;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use mpc_poc_near::{ft, mpc};
+use mpc_poc_near::{ft, mpc, payments};
+
+// ── Clap args ────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(name = "mpc-worker", about = "MPC Worker Daemon")]
@@ -87,6 +89,8 @@ struct Worker {
     sponsor_key: String,
     sponsor_account: near_api::AccountId,
     network: near_api::NetworkConfig,
+    pricing: payments::Pricing,
+    payment: Box<dyn payments::PaymentProvider>,
 }
 
 impl Worker {
@@ -100,7 +104,20 @@ impl Worker {
         let sponsor_account: near_api::AccountId = std::env::var("SPONSOR_ACCOUNT")
             .context("Set SPONSOR_ACCOUNT")?.parse().context("Invalid SPONSOR_ACCOUNT")?;
         let network = near_api::NetworkConfig::from_rpc_url("testnet", "https://rpc.testnet.near.org".parse()?);
-        Ok(Self { relay_url, keys, sponsor_key, sponsor_account, network })
+
+        // Set up payment provider
+        let payment: Box<dyn payments::PaymentProvider> = if std::env::var("NWC_URL").is_ok() {
+            println!("Using NIP-47 (NWC) payment provider");
+            Box::new(payments::NwcPaymentProvider::from_env()?)
+        } else if std::env::var("NO_PAYMENT").is_ok() {
+            println!("Payment disabled (NO_PAYMENT set) — free processing");
+            Box::new(payments::FreePaymentProvider::new())
+        } else {
+            println!("Using mock payment provider (auto-approves all payments)");
+            Box::new(payments::MockPaymentProvider::auto_approving())
+        };
+
+        Ok(Self { relay_url, keys, sponsor_key, sponsor_account, network, pricing: payments::Pricing::default(), payment })
     }
 
     async fn run(&self, pidfile: &str) -> Result<()> {
@@ -273,26 +290,81 @@ impl Worker {
         // 1. Verify signature (secp256k1 schnorr)
         if !event.verify_signature() {
             tracing::warn!("Invalid signature from {}", &pk_hex[..16]);
-            self.publish_feedback(&event, "error", "Invalid signature").await?;
+            self.publish_feedback(event, "error", "Invalid signature").await?;
             return Ok(());
         }
         println!("   ✅ Signature valid (secp256k1 schnorr)");
 
-        // 2. Parse job
+        // 2. Check for payment_hash tag (user has paid)
+        let payment_hash_tag = event.tags.iter()
+            .find(|t| t.kind() == TagKind::custom("payment_hash"))
+            .and_then(|t| t.content());
+
+        // 3. Parse job to calculate price
         let raw: NostrEventJson = serde_json::from_value(event_json.clone())?;
         let params = parse_job(&raw)?;
         let token = params.token_contract.as_deref().unwrap_or("NEAR");
         println!("   📋 Send {} {} to {}", params.amount, token, params.to);
 
-        // 3. Derive MPC key
+        // 4. Payment check
+        if let Some(ph) = payment_hash_tag {
+            // User claims to have paid — verify
+            match self.payment.check_payment(ph).await {
+                Ok(payments::PaymentStatus::Paid) => {
+                    println!("   ✅ Payment confirmed: {}...", &ph[..16]);
+                }
+                Ok(payments::PaymentStatus::Expired) => {
+                    self.publish_feedback(event, "error", "Payment expired").await?;
+                    return Ok(());
+                }
+                Ok(payments::PaymentStatus::Pending) => {
+                    self.publish_feedback(event, "error", &format!(
+                        "Payment not confirmed yet: {}", ph
+                    )).await?;
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.publish_feedback(event, "error", &format!("Payment check failed: {}", e)).await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            // No payment yet — calculate price and request payment
+            let amount: f64 = params.amount.parse().unwrap_or(0.0);
+            let price_sats = if token == "NEAR" {
+                self.pricing.price_transfer(amount)
+            } else {
+                self.pricing.price_ft_transfer()
+            };
+
+            println!("   💰 Price: {} sats", price_sats);
+            let desc = format!("NEAR transfer: {} {} to {}", params.amount, token, params.to);
+
+            match self.payment.create_invoice(price_sats, &desc).await {
+                Ok(invoice) => {
+                    let msg = format!(
+                        "payment_required|invoice:{}|amount:{}|hash:{}|expires:{}",
+                        invoice.bolt11, invoice.amount_sats, invoice.payment_hash, invoice.expires_at,
+                    );
+                    self.publish_feedback(event, "payment_required", &msg).await?;
+                    println!("   📤 Invoice sent: {} sats", price_sats);
+                    return Ok(());
+                }
+                Err(e) => {
+                    self.publish_feedback(event, "error", &format!("Failed to create invoice: {}", e)).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // 5. Payment confirmed — execute the transfer
         let path = format!("nostr:{}", pk_hex);
-        let mpc_key = self.derive_key(&path).await?;
+        let mpc_key = mpc::derive_public_key(&path, self.sponsor_account.as_str(), &self.network).await?;
         println!("   🔑 MPC key: {}...", &mpc_key[..40.min(mpc_key.len())]);
 
-        // 4. Build tx, sign via MPC, broadcast
-        match self.execute_transfer(&raw, &params, &pk_hex).await {
+        match self.execute_transfer(&params, &pk_hex).await {
             Ok(tx_hash) => {
-                self.publish_feedback(&event, "success", &format!(
+                self.publish_feedback(event, "success", &format!(
                     "Sent {} {} to {} | tx: {}",
                     params.amount, token, params.to, tx_hash
                 )).await?;
@@ -300,7 +372,7 @@ impl Worker {
             Err(e) => {
                 let msg = format!("Failed: {}", e);
                 tracing::error!("{}", msg);
-                self.publish_feedback(&event, "error", &msg).await?;
+                self.publish_feedback(event, "error", &msg).await?;
             }
         }
 
@@ -308,13 +380,8 @@ impl Worker {
         Ok(())
     }
 
-    async fn derive_key(&self, path: &str) -> Result<String> {
-        mpc::derive_public_key(path, self.sponsor_account.as_str(), &self.network).await
-    }
-
     async fn execute_transfer(
         &self,
-        _raw_event: &NostrEventJson,
         params: &JobParams,
         sender_pk_hex: &str,
     ) -> Result<String> {
@@ -325,7 +392,7 @@ impl Worker {
         use std::str::FromStr;
 
         let path = format!("nostr:{}", sender_pk_hex);
-        let near_public_key = self.derive_key(&path).await?;
+        let near_public_key = mpc::derive_public_key(&path, self.sponsor_account.as_str(), &self.network).await?;
 
         // Resolve the sender's NEAR account from the nostr pubkey binding
         // For now, we use the pubkey hex as account lookup

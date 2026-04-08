@@ -133,8 +133,8 @@ async fn test_funded_transfer() -> Result<()> {
         println!("  ✅ Funded");
     }
 
-    // ── Step 3: Send transfer via Nostr ──────────────────────
-    println!("\n[3/4] Sending transfer via kind 5001...");
+    // ── Step 3: Send transfer via Nostr (triggers invoice) ─────
+    println!("\n[3/5] Sending transfer request via kind 5001 (expect invoice)...");
     let transfer_amount = "0.001";
     let transfer_to = "kampouse.testnet";
     let job_params = serde_json::json!({
@@ -155,10 +155,56 @@ async fn test_funded_transfer() -> Result<()> {
     assert!(accepted, "Relay should accept transfer");
     println!("  ✅ Sent transfer request: {} NEAR → {}", transfer_amount, transfer_to);
 
-    // ── Step 4: Wait for result ──────────────────────────────
-    println!("\n[4/4] Waiting for transfer result (60s)...");
-    let tx_feedback = wait_for_feedback(&relay_url, &tx_event.id.to_hex(), 60).await?
-        .context("No transfer feedback from worker")?;
+    // ── Step 4: Wait for invoice ─────────────────────────────
+    println!("\n[4/5] Waiting for invoice from worker...");
+    let invoice_feedback = wait_for_feedback(&relay_url, &tx_event.id.to_hex(), 30).await?
+        .context("No invoice feedback")?;
+
+    let invoice_status = invoice_feedback.tags.iter()
+        .find(|t| t.kind() == TagKind::custom("status"))
+        .and_then(|t| t.content())
+        .unwrap_or("?").to_string();
+    println!("  Status: {}", invoice_status);
+    println!("  Content: {}", invoice_feedback.content);
+
+    if invoice_status != "payment_required" {
+        anyhow::bail!("Expected payment_required, got: {}", invoice_status);
+    }
+
+    // Parse invoice from feedback
+    let mut bolt11 = "";
+    let mut payment_hash = "";
+    for part in invoice_feedback.content.split('|') {
+        match part {
+            p if p.starts_with("invoice:") => bolt11 = &p[8..],
+            p if p.starts_with("hash:") => payment_hash = &p[5..],
+            _ => {}
+        }
+    }
+    println!("  ⚡ Invoice: {}...", &bolt11[..40.min(bolt11.len())]);
+    println!("  📋 Payment hash: {}...", &payment_hash[..16]);
+    assert!(!bolt11.is_empty(), "Should have an invoice");
+
+    // ── Step 5: Pay & re-submit with proof ────────────────────
+    println!("\n[5/5] Re-submitting with payment proof...");
+    let paid_tags = vec![
+        Tag::custom(TagKind::custom("i"), [&job_params]),
+        Tag::custom(TagKind::custom("payment_hash"), [payment_hash]),
+    ];
+
+    let paid_event = EventBuilder::new(Kind::Custom(5001), &job_params)
+        .tags(paid_tags)
+        .sign_with_keys(&sender_keys)?;
+    assert!(paid_event.verify_signature());
+
+    let accepted = send_event(&relay_url, &paid_event).await?;
+    assert!(accepted, "Relay should accept paid transfer");
+    println!("  ✅ Sent paid transfer request");
+
+    // Wait for transfer result
+    println!("  Waiting for transfer result (60s)...");
+    let tx_feedback = wait_for_feedback(&relay_url, &paid_event.id.to_hex(), 60).await?
+        .context("No transfer feedback")?;
 
     let tx_status = tx_feedback.tags.iter()
         .find(|t| t.kind() == TagKind::custom("status"))
@@ -169,13 +215,9 @@ async fn test_funded_transfer() -> Result<()> {
     println!("  Content: {}", tx_feedback.content);
 
     if tx_status == "success" {
-        println!("\n  ✅ TRANSFER SUCCEEDED!");
-        if let Some(tx_hash) = tx_feedback.content.split("tx: ").nth(1) {
-            println!("  🔗 https://explorer.testnet.near.org/transactions/{}", tx_hash);
-        }
+        println!("\n  ✅ FUNDED TRANSFER WITH PAYMENT SUCCEEDED!");
     } else {
-        println!("\n  ⚠️  Transfer failed (this is expected if MPC signing doesn't return yet)");
-        println!("  The MPC yield-resume pattern may need a polling mechanism");
+        println!("\n  ⚠️  Transfer status: {} (mock payments should auto-approve)", tx_status);
     }
 
     println!("\n═══════════════════════════════════════════════════");
