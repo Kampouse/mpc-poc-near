@@ -1602,6 +1602,7 @@ name = "nostr-mpc-poc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "borsh",
  "bs58",
  "clap",
@@ -1615,6 +1616,7 @@ dependencies = [
  "near-api",
  "nostr",
  "nostr-sdk",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",

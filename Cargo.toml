@@ -45,3 +45,5 @@ daemonize = "0.5"
 dirs = "6"
 signal-hook = "0.3"
 signal-hook-tokio = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"

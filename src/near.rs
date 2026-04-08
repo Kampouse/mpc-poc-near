@@ -206,11 +206,18 @@ async fn sign_and_send(cfg: &Config, unsigned_tx: &Transaction) -> Result<()> {
     let auth_sig = cfg.nostr_sk.sign(auth_msg.as_bytes());
     println!("③ Nostr auth: {}...✅", &hex::encode(auth_sig.to_bytes())[..16]);
 
-    // Call MPC to sign the tx hash
-    let _sign_result = mpc::sign_payload_with_config(cfg, &tx_hash).await?;
-    println!("④ MPC signed. TODO: assemble signed tx & broadcast");
-    println!("   Track: https://explorer.testnet.near.org/accounts/{}", cfg.near_account);
-    // TODO: convert SignResult (big_r, s, recovery_id) to ed25519 signature
-    //       assemble SignedTransaction, broadcast via RPC
+    // Call MPC to sign + broadcast
+    let (sponsor_id, sponsor_key) = cfg.require_sponsor()?;
+    let tx_hash_str = mpc::sign_and_broadcast(
+        unsigned_tx,
+        &tx_hash,
+        &cfg.mpc_path,
+        cfg.near_account.as_str(),
+        sponsor_id,
+        sponsor_key,
+        &cfg.network,
+    ).await?;
+
+    println!("④ TX finalized: {}", tx_hash_str);
     Ok(())
 }

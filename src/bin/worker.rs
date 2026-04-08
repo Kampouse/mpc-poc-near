@@ -313,8 +313,9 @@ impl Worker {
         let tx_hash: [u8; 32] = sha2::Sha256::digest(&tx_bytes).into();
         println!("   TX hash: {}", hex::encode(tx_hash));
 
-        // Call MPC to sign
-        let _sign_result = mpc::sign_payload(
+        // Call MPC to sign + broadcast
+        let tx_hash = mpc::sign_and_broadcast(
+            &unsigned_tx,
             &tx_hash,
             &path,
             sender_account.as_str(),
@@ -323,10 +324,7 @@ impl Worker {
             &self.network,
         ).await?;
 
-        // TODO: Convert SignResult (big_r, s, recovery_id) → ed25519 signature
-        //       Assemble SignedTransaction and broadcast via RPC
-        // For now, return the tx hash as proof
-        Ok(hex::encode(tx_hash))
+        Ok(tx_hash)
     }
 
     async fn publish_feedback(&self, original: &nostr::Event, status: &str, msg: &str) -> Result<()> {
