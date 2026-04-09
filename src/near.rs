@@ -17,7 +17,7 @@ pub async fn create_account(cfg: &Config) -> Result<()> {
     let near_public_key = derive_key(cfg).await?;
     let signer = near_api::Signer::from_secret_key(funder_key.parse()?)?;
 
-    println!("Creating {} with MPC-derived key\n", cfg.near_account);
+    tracing::info!("Creating {} with MPC-derived key", cfg.near_account);
 
     let result = Account::create_account(cfg.near_account.clone())
         .fund_myself(funder_id.clone(), NearToken::from_near(0))
@@ -89,7 +89,6 @@ pub async fn show_balances(cfg: &Config) -> Result<()> {
 
 // ── Transfer ─────────────────────────────────────────────────────────────────
 
-/// Derive key for this config
 pub async fn derive_key(cfg: &Config) -> Result<String> {
     mpc::derive_public_key(&cfg.mpc_path, cfg.near_account.as_str(), &cfg.network).await
 }
@@ -198,10 +197,12 @@ async fn sign_and_send(cfg: &Config, unsigned_tx: &Transaction) -> Result<()> {
     let tx_hash: [u8; 32] = Sha256::digest(&tx_bytes).into();
     println!("② TX hash: {}", hex::encode(tx_hash));
 
-    // Nostr authorization proof
+    // Nostr authorization proof (sign with nostr key)
     let auth_msg = format!("authorize from {} | hash:{}", cfg.near_account, hex::encode(tx_hash));
-    let auth_sig = ed25519_dalek::Signer::sign(&cfg.nostr_sk, auth_msg.as_bytes());
-    println!("③ Nostr auth: {}...✅", &hex::encode(auth_sig.to_bytes())[..16]);
+    let auth_event = nostr::EventBuilder::new(nostr::Kind::Custom(1), &auth_msg)
+        .sign_with_keys(&cfg.keys)?;
+    let sig_hex = hex::encode(auth_event.sig.serialize());
+    println!("③ Nostr auth: {}...✅", &sig_hex[..16]);
 
     // Call MPC to sign + broadcast
     let (sponsor_id, sponsor_key) = cfg.require_sponsor()?;

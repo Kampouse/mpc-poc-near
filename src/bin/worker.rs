@@ -21,13 +21,16 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-use mpc_poc_near::{ft, mpc, payments};
+use mpc_poc_near::{config, ft, mpc, near, payments};
 
 // ── Clap ─────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
-#[command(name = "mpc-worker", about = "MPC Worker Daemon")]
+#[command(name = "mpc-worker", about = "Nostr → MPC → NEAR with Lightning payments")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Commands>,
+
     #[arg(long)]
     daemon: bool,
     #[arg(long)]
@@ -38,6 +41,35 @@ struct Cli {
     pidfile: String,
     #[arg(long, default_value = "~/.mpc-worker/worker.log")]
     logfile: String,
+}
+
+#[derive(clap::Subcommand)]
+enum Commands {
+    /// Start the Nostr relay daemon (default if no subcommand)
+    Run,
+    /// Create a NEAR account with MPC-derived key
+    Create,
+    /// Show account info and MPC derivation
+    Info,
+    /// Show NEAR balance + common FT balances
+    Balances,
+    /// Check a specific FT token balance
+    Balance {
+        /// Token contract account ID
+        contract_id: String,
+    },
+    /// Send NEAR or any FT token via MPC signing
+    Transfer {
+        /// Recipient account ID
+        to: String,
+        /// Amount to send (human-readable, e.g. 1.5)
+        amount: String,
+        /// Token contract ID (omit for NEAR)
+        #[arg(last = true)]
+        token: Option<String>,
+    },
+    /// Test Nostr key signature
+    SignTest,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -583,6 +615,7 @@ async fn main() -> Result<()> {
     let pidfile = expand(&cli.pidfile);
     let logfile = expand(&cli.logfile);
 
+    // ── Status/stop flags ──────────────────────────────────────────────────
     if cli.status {
         match read_pid(&pidfile) {
             Some(pid) if is_running(pid) => println!("✅ Running (PID {})", pid),
@@ -595,7 +628,6 @@ async fn main() -> Result<()> {
     if cli.stop {
         match read_pid(&pidfile) {
             Some(pid) if is_running(pid) => {
-                // #3: Graceful shutdown — give time for in-flight ops
                 unsafe { libc::kill(pid, libc::SIGTERM) };
                 println!("Sent SIGTERM to PID {} (graceful shutdown, 15s)", pid);
                 for _ in 0..30 {
@@ -616,6 +648,47 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // ── CLI subcommands ────────────────────────────────────────────────────
+    match cli.command {
+        Some(Commands::Create) => {
+            tracing_subscriber::fmt::init();
+            let cfg = config::Config::from_env()?;
+            return near::create_account(&cfg).await;
+        }
+        Some(Commands::Info) => {
+            tracing_subscriber::fmt::init();
+            let cfg = config::Config::from_env()?;
+            return near::show_info(&cfg).await;
+        }
+        Some(Commands::Balances) => {
+            tracing_subscriber::fmt::init();
+            let cfg = config::Config::from_env()?;
+            return near::show_balances(&cfg).await;
+        }
+        Some(Commands::Balance { contract_id }) => {
+            tracing_subscriber::fmt::init();
+            let cfg = config::Config::from_env()?;
+            return ft::show_balance(&cfg, &contract_id).await;
+        }
+        Some(Commands::Transfer { to, amount, token }) => {
+            tracing_subscriber::fmt::init();
+            let cfg = config::Config::from_env()?;
+            return near::transfer(&cfg, &to, &amount, token.as_deref()).await;
+        }
+        Some(Commands::SignTest) => {
+            tracing_subscriber::fmt::init();
+            let cfg = config::Config::from_env()?;
+            // Sign a test message with the Nostr key
+            let test_msg = "nostr-mpc recovery test";
+            let event = nostr::EventBuilder::new(nostr::Kind::Custom(1), test_msg)
+                .sign_with_keys(&cfg.keys)?;
+            println!("{} — ✅", hex::encode(event.sig.serialize()));
+            return Ok(());
+        }
+        _ => {} // Run or no subcommand → daemon mode
+    }
+
+    // ── Daemon mode ────────────────────────────────────────────────────────
     if cli.daemon {
         match unsafe { libc::fork() } {
             -1 => anyhow::bail!("Fork failed"),
@@ -628,7 +701,6 @@ async fn main() -> Result<()> {
         }
         unsafe { libc::setsid(); }
 
-        // #15: Always log to file (daemon or foreground with --logfile)
         if let Ok(log) = std::fs::File::options().create(true).append(true).open(&logfile) {
             use std::os::unix::io::IntoRawFd;
             let fd = log.into_raw_fd();
@@ -640,7 +712,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    // #15: Log to file even in foreground mode
+    // Log to file in foreground mode too
     let log_file = std::fs::File::options()
         .create(true)
         .append(true)

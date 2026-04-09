@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use ed25519_dalek::{SigningKey, VerifyingKey};
 use near_api::AccountId;
+use nostr::key::Keys;
 
-pub struct Config {    pub nostr_sk: SigningKey,
-    pub nostr_pk: VerifyingKey,
+pub struct Config {
+    pub keys: Keys,
     pub npub: String,
     pub near_account: AccountId,
     pub mpc_path: String,
@@ -16,15 +16,13 @@ pub struct Config {    pub nostr_sk: SigningKey,
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let nostr_sk_hex = env("NOSTR_SK")?;
-        let sk_bytes: [u8; 32] = hex::decode(&nostr_sk_hex)
-            .context("NOSTR_SK must be 64 hex chars")?
+        let nsec_hex = env("WORKER_NSEC").or_else(|_| env("NOSTR_SK"))?;
+        let sk_bytes: [u8; 32] = hex::decode(&nsec_hex)
+            .context("Key must be 64 hex chars")?
             .try_into()
-            .map_err(|_| anyhow::anyhow!("NOSTR_SK must be exactly 32 bytes"))?;
-
-        let nostr_sk = SigningKey::from_bytes(&sk_bytes);
-        let nostr_pk = nostr_sk.verifying_key();
-        let npub = hex::encode(nostr_pk.as_bytes());
+            .map_err(|_| anyhow::anyhow!("Key must be exactly 32 bytes"))?;
+        let keys = Keys::new(nostr::SecretKey::from_slice(&sk_bytes)?);
+        let npub = keys.public_key().to_hex();
         let near_account: AccountId = env("NEAR_ACCOUNT")?.parse()
             .context("NEAR_ACCOUNT is not a valid account ID")?;
         let mpc_path = format!("nostr:{}", npub);
@@ -35,8 +33,7 @@ impl Config {
         );
 
         Ok(Self {
-            nostr_sk,
-            nostr_pk,
+            keys,
             npub,
             near_account,
             mpc_path,
